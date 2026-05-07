@@ -128,8 +128,151 @@ class MyPlugin(Star):
         )
         yield event.plain_result(response.completion_text)
 
-####################Feishu contacts connection testing prompts end####################
-# todo: 添加一些 Feishu 联系人连接测试的指令，例如获取联系人列表、获取特定联系人的信息等。
+####################Feishu contact connection testing####################
+
+    @filter.command("test_feishu_contact")
+    async def test_feishu_contact(self, event: AstrMessageEvent):
+        """测试飞书通讯录连接，列出根部门架构与成员角色。"""
+        from lark_oapi.api.contact.v3 import ListDepartmentRequest, ListUserRequest
+
+        platform = self.context.get_platform_inst(event.get_platform_id())
+        lark_api = getattr(platform, "lark_api", None)
+        if not lark_api:
+            yield event.plain_result("未找到飞书适配器，请确认当前平台为飞书。")
+            return
+
+        # fetch root departments (parent_department_id="0" means root)
+        dept_req = (
+            ListDepartmentRequest.builder()
+            .parent_department_id("0")
+            .page_size(50)
+            .build()
+        )
+        dept_resp = await lark_api.contact.v3.department.alist(dept_req)
+        if not dept_resp.success():
+            yield event.plain_result(
+                f"获取部门列表失败\ncode: {dept_resp.code}\nmsg: {dept_resp.msg}"
+            )
+            return
+
+        departments = dept_resp.data.items or []
+        lines = [f"══ 飞书通讯录（根部门共 {len(departments)} 个）══", ""]
+
+        for dept in departments:
+            dept_id = dept.department_id or ""
+            dept_open_id = getattr(dept, "open_department_id", "") or ""
+            member_count = getattr(dept, "member_count", "?")
+            lines.append(f"📁 {dept.name}  (id: {dept_id}, 成员数: {member_count})")
+
+            # fetch users in this department
+            user_req = (
+                ListUserRequest.builder()
+                .department_id(dept_open_id)
+                .user_id_type("open_id")
+                .page_size(50)
+                .build()
+            )
+            user_resp = await lark_api.contact.v3.user.alist(user_req)
+
+            if not user_resp.success():
+                lines.append(f"  └─ 获取成员失败: {user_resp.msg}")
+                lines.append("")
+                continue
+
+            users = user_resp.data.items or []
+            if not users:
+                lines.append("  └─ （暂无成员）")
+            else:
+                for i, u in enumerate(users):
+                    prefix = "  └─" if i == len(users) - 1 else "  ├─"
+                    job_title = getattr(u, "job_title", "") or ""
+                    job_level = getattr(u, "job_level_name", "") or ""
+                    details = " | ".join([x for x in [job_title, job_level] if x])
+                    line = f"{prefix} {u.name}"
+                    if details:
+                        line += f"  [{details}]"
+                    lines.append(line)
+            lines.append("")
+
+        if not departments:
+            lines.append("未找到任何部门，请确认应用通讯录权限已授权。")
+
+        yield event.plain_result("\n".join(lines))
+
+
+    @filter.command("list_contacts")
+    async def list_contacts(self, event: AstrMessageEvent):
+        """列出飞书通讯录中所有成员（扁平列表，不含部门树）。"""
+        logger.info(f"CMD HIT | msg: {repr(event.message_str)} | is_wake: {event.is_wake}")
+
+        from lark_oapi.api.contact.v3 import ListDepartmentRequest, ListUserRequest
+
+        platform = self.context.get_platform_inst(event.get_platform_id())
+        lark_api = getattr(platform, "lark_api", None)
+        if not lark_api:
+            yield event.plain_result("未找到飞书适配器，请确认当前平台为飞书。")
+            return
+
+        dept_req = (
+            ListDepartmentRequest.builder()
+            .parent_department_id("0")
+            .page_size(50)
+            .build()
+        )
+        dept_resp = await lark_api.contact.v3.department.alist(dept_req)
+        if not dept_resp.success():
+            yield event.plain_result(
+                f"获取部门列表失败\ncode: {dept_resp.code}\nmsg: {dept_resp.msg}"
+            )
+            return
+
+        departments = dept_resp.data.items or []
+        if not departments:
+            yield event.plain_result("未找到任何部门，请确认应用通讯录权限已授权。")
+            return
+
+        seen = set()
+        contacts = []
+        errors = []
+
+        for dept in departments:
+            dept_open_id = getattr(dept, "open_department_id", "") or ""
+            user_req = (
+                ListUserRequest.builder()
+                .department_id(dept_open_id)
+                .user_id_type("open_id")
+                .page_size(50)
+                .build()
+            )
+            user_resp = await lark_api.contact.v3.user.alist(user_req)
+            if not user_resp.success():
+                errors.append(f"部门「{dept.name}」(id:{dept_open_id}) 获取成员失败: code={user_resp.code} msg={user_resp.msg}")
+                continue
+            for u in user_resp.data.items or []:
+                if u.open_id not in seen:
+                    logger.info(f"User raw: {vars(u)}")
+                    seen.add(u.open_id)
+                    job_title = getattr(u, "job_title", "") or ""
+                    contacts.append((u.name, job_title))
+
+        if errors:
+            logger.warning("list_contacts 部分部门获取失败:\n" + "\n".join(errors))
+
+        if not contacts:
+            diag = f"找到 {len(departments)} 个部门，但未能获取任何成员。"
+            if errors:
+                diag += "\n\n错误详情：\n" + "\n".join(errors)
+            yield event.plain_result(diag)
+            return
+
+        lines = [f"══ 飞书通讯录成员（共 {len(contacts)} 人）══", ""]
+        for i, (name, title) in enumerate(contacts, 1):
+            line = f"{i}. {name}"
+            if title:
+                line += f"  [{title}]"
+            lines.append(line)
+
+        yield event.plain_result("\n".join(lines))
 
 
 ######################Astrbot bot persona testing prompts####################
@@ -190,6 +333,8 @@ class MyPlugin(Star):
             value=session_config,
         )
         yield event.plain_result(f"✅ 当前会话人格已切换为「{name}」。")
+
+
 
     async def terminate(self):
         """可选择实现异步的插件销毁方法，当插件被卸载/停用时会调用。"""
