@@ -19,25 +19,39 @@
 #    and domain-specific abstractions on top.
 #=====================================================
 
-## Dependencies
-# from lark_oapi.api.docx.v1 import RawContentDocumentRequest, CreateDocumentRequest, ...
-# from lark_oapi.api.drive.v1 import ListFileRequest
+from lark_oapi.api.docx.v1 import RawContentDocumentRequest
+from lark_oapi.api.drive.v1 import ListFileRequest
 
-## DocService
-#
-# class DocService:
-#     __init__(lark_api)
-#         # store lark_api client
-#
-#     list_folder_files(folder_token) -> List[dict]
-#         # list all files inside a Feishu Drive folder
-#         # returns list of {name, token, type, url}
-#
-#     read_doc_plaintext(document_id) -> str
-#         # call RawContentDocumentRequest
-#         # return clean plain text content of the doc
-#
-#     create_report_doc(folder_token, title, content_blocks) -> str
-#         # step 1: create a new doc in the folder (CreateDocumentRequest)
-#         # step 2: write content blocks into the doc
-#         # return the doc URL for sharing
+
+class DocService:
+    def __init__(self, lark_api):
+        self.lark_api = lark_api
+
+    async def list_folder_files(self, folder_token: str) -> list:
+        """List files in a Feishu Drive folder. Returns list of file objects."""
+        req = (
+            ListFileRequest.builder()
+            .folder_token(folder_token)
+            .page_size(10)
+            .build()
+        )
+        resp = await self.lark_api.drive.v1.file.alist(req)
+        if not resp.success():
+            raise RuntimeError(f"code={resp.code} msg={resp.msg}")
+        return resp.data.files or []
+
+    async def read_doc_plaintext(self, doc_token: str) -> str:
+        """Read raw plaintext content of a Feishu Doc."""
+        req = (
+            RawContentDocumentRequest.builder()
+            .document_id(doc_token)
+            .build()
+        )
+        resp = await self.lark_api.docx.v1.document.araw_content(req)
+        if not resp.success():
+            raise RuntimeError(f"code={resp.code} msg={resp.msg}")
+        return resp.data.content or ""
+
+    async def create_report_doc(self, folder_token: str, title: str, content_blocks: list) -> str:
+        """Create a new doc in the folder and write content blocks into it. Returns doc URL."""
+        raise NotImplementedError

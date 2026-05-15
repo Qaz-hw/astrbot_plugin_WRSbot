@@ -20,10 +20,8 @@ from astrbot.api.star import Context, Star, register
 from astrbot.api import logger, sp
 from astrbot.api.platform import MessageType
 
-from lark_oapi.api.drive.v1 import ListFileRequest
-from lark_oapi.api.docx.v1 import RawContentDocumentRequest
-
 from .services.lark_card import LarkCardService
+from .services.doc import DocService
 
 
 @register("helloworld", "YourName", "一个简单的 Hello World 插件", "1.0.0")
@@ -33,6 +31,7 @@ class MyPlugin(Star):
         self.context: Context = context
         self.lark_api = None
         self.card_service: LarkCardService = None
+        self.doc_service: DocService = None
 
     async def initialize(self):
         """Grab lark_api from the platform adapter and set up services."""
@@ -44,6 +43,7 @@ class MyPlugin(Star):
 
         self.card_service = LarkCardService(self.lark_api)
         self.card_service.inject_into_dispatcher(self.context.platform_manager)
+        self.doc_service = DocService(self.lark_api)
 
 #==============================================================
 #                         Card Commands
@@ -467,14 +467,12 @@ class MyPlugin(Star):
         """测试飞书文档权限：列举文件（访问）、读取内容。
         用法：/test_feishu_doc [folder_token]"""
 
-        inline_token = event.message_str.removeprefix("test_feishu_doc").strip().split("?")[0].strip()
-        folder_token = inline_token or await sp.get_async(scope="global", scope_id="wrsbot", key="doc_folder_token", default="") or ""
-
-        platform = self.context.get_platform_inst(event.get_platform_id())
-        lark_api = getattr(platform, "lark_api", None)
-        if not lark_api:
+        if not self.lark_api:
             yield event.plain_result("未找到飞书适配器，请确认当前平台为飞书。")
             return
+
+        inline_token = event.message_str.removeprefix("test_feishu_doc").strip().split("?")[0].strip()
+        folder_token = inline_token or await sp.get_async(scope="global", scope_id="wrsbot", key="doc_folder_token", default="") or ""
 
         scope_label = f"指定文件夹 (token: {folder_token})" if folder_token else "机器人云空间根目录"
         lines = ["══ 飞书文档访问测试 ══", f"  目标: {scope_label}", ""]
@@ -482,43 +480,25 @@ class MyPlugin(Star):
         lines.append("【1】访问测试 — 列举目标文件夹内容")
         doc_token = None
         try:
-            list_req = (
-                ListFileRequest.builder()
-                .folder_token(folder_token)
-                .page_size(10)
-                .build()
-            )
-            list_resp = await lark_api.drive.v1.file.alist(list_req)
-            if list_resp.success():
-                files = list_resp.data.files or []
-                lines.append(f"  ✅ 成功，共 {len(files)} 个条目")
-                for f in files:
-                    lines.append(f"  - [{f.type}] {f.name}  (token: {f.token})")
-                    if f.type == "docx" and doc_token is None:
-                        doc_token = f.token
-            else:
-                lines.append(f"  ❌ 失败: code={list_resp.code}  msg={list_resp.msg}")
+            files = await self.doc_service.list_folder_files(folder_token)
+            lines.append(f"  ✅ 成功，共 {len(files)} 个条目")
+            for f in files:
+                lines.append(f"  - [{f.type}] {f.name}  (token: {f.token})")
+                if f.type == "docx" and doc_token is None:
+                    doc_token = f.token
         except Exception as e:
-            lines.append(f"  ❌ 异常: {e}")
+            lines.append(f"  ❌ 失败: {e}")
 
         lines.append("")
         lines.append("【2】读取测试 — 读取文档原始内容")
         if doc_token:
             try:
-                read_req = (
-                    RawContentDocumentRequest.builder()
-                    .document_id(doc_token)
-                    .build()
-                )
-                read_resp = await lark_api.docx.v1.document.araw_content(read_req)
-                if read_resp.success():
-                    content = (read_resp.data.content or "").replace("\n", " ")
-                    preview = content[:120] + ("..." if len(content) > 120 else "")
-                    lines.append(f"  ✅ 成功，内容预览: {preview}")
-                else:
-                    lines.append(f"  ❌ 失败: code={read_resp.code}  msg={read_resp.msg}")
+                content = await self.doc_service.read_doc_plaintext(doc_token)
+                content = content.replace("\n", " ")
+                preview = content[:120] + ("..." if len(content) > 120 else "")
+                lines.append(f"  ✅ 成功，内容预览: {preview}")
             except Exception as e:
-                lines.append(f"  ❌ 异常: {e}")
+                lines.append(f"  ❌ 失败: {e}")
         else:
             lines.append("  ⚠️ 跳过：未找到 docx 文件")
 
