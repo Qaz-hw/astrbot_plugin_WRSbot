@@ -19,6 +19,118 @@
 #    - Bitable or Doc API calls
 #=====================================================
 
+# ╔══════════════════════════════════════════════════════════════════════════════╗
+# ║                      WRSbot · Card Interaction Map                         ║
+# ╚══════════════════════════════════════════════════════════════════════════════╝
+#
+#  Notation:
+#    →  card     card update (same message replaced in-place)
+#    ⇒  card     new message sent
+#    ✉           async message dispatched to another user
+#    [TBD]       card not yet created in Feishu card builder
+#
+# ┌──────────────────────────────────────────────────────────────────────────────┐
+# │  WRSBOT_WELCOME_CARD_ID                                                     │
+# │  Trigger: first contact with bot / /start command                           │
+# ├──────────────────────┬──────────────────────────┬───────────────────────────┤
+# │  Button              │  Condition               │  Result                   │
+# ├──────────────────────┼──────────────────────────┼───────────────────────────┤
+# │  指令列表             │  always                  │  toast: 指令列表          │
+# │  使用帮助             │  always                  │  toast: 帮助信息          │
+# │  角色说明             │  always                  │  toast: 角色说明          │
+# │  文件夹配置           │  always                  │  → BINDFOLDER_TUTORIAL    │
+# │  开始使用             │  已配置 · 管理员          │  → ADMIN_DASHBOARD [TBD]  │
+# │  开始使用             │  已配置 · 员工            │  → USER_DASHBOARD  [TBD]  │
+# │  开始使用 [disabled]  │  文件夹未配置             │  toast: 请先完成配置      │
+# └──────────────────────┴──────────────────────────┴───────────────────────────┘
+#
+# ┌──────────────────────────────────────────────────────────────────────────────┐
+# │  WRSBOT_BINDFOLDER_TUTORIAL_CARD_ID                                         │
+# │  Trigger: 文件夹配置 on welcome card                                         │
+# │  Context: bot prompts user to reply with a Feishu folder share URL          │
+# ├──────────────────────┬──────────────────────────┬───────────────────────────┤
+# │  Button              │  Condition               │  Result                   │
+# ├──────────────────────┼──────────────────────────┼───────────────────────────┤
+# │  重新扫描             │  URL found in chat       │  → BINDING_SUCCESS        │
+# │  重新扫描             │  URL not found           │  → NOT_BINDING_FEEDBACK   │
+# │  我已回复链接         │  URL found in chat       │  → BINDING_SUCCESS        │
+# │  我已回复链接         │  URL not found           │  → NOT_BINDING_FEEDBACK   │
+# └──────────────────────┴──────────────────────────┴───────────────────────────┘
+#
+# ┌──────────────────────────────────────────────────────────────────────────────┐
+# │  WRSBOT_BINDING_FEEDBACK_SUCCESS_CARD_ID                                    │
+# │  Trigger: folder URL detected after button click                            │
+# │  Terminal — no buttons                                                      │
+# └──────────────────────────────────────────────────────────────────────────────┘
+#
+# ┌──────────────────────────────────────────────────────────────────────────────┐
+# │  WRSBOT_NOT_BINDING_FEEDBACK_CARD_ID                                        │
+# │  Trigger: no folder URL detected after button click                         │
+# ├──────────────────────┬──────────────────────────┬───────────────────────────┤
+# │  Button              │  Condition               │  Result                   │
+# ├──────────────────────┼──────────────────────────┼───────────────────────────┤
+# │  重试                 │  always                  │  → BINDFOLDER_TUTORIAL    │
+# └──────────────────────┴──────────────────────────┴───────────────────────────┘
+#
+# ┌──────────────────────────────────────────────────────────────────────────────┐
+# │  WRSBOT_ADMIN_DASHBOARD_CARD_ID                                    [TBD]    │
+# │  Trigger: 开始使用 · manager role                                            │
+# │  Shows: X / N 人已提交本周周报                                               │
+# ├──────────────────────┬──────────────────────────┬───────────────────────────┤
+# │  Button              │  Condition               │  Result                   │
+# ├──────────────────────┼──────────────────────────┼───────────────────────────┤
+# │  查看周报文件         │  always                  │  link → folder URL        │
+# │  催交报告             │  有未提交成员             │  ✉ SUBMISSION_REMINDER    │
+# │                      │                          │    sent to each non-sub   │
+# │  开始周报汇总         │  all submitted           │  start pipeline           │
+# │  开始周报汇总         │  not all submitted       │  → CONFIRM_PARTIAL [TBD]  │
+# └──────────────────────┴──────────────────────────┴───────────────────────────┘
+#
+# ┌──────────────────────────────────────────────────────────────────────────────┐
+# │  WRSBOT_SUBMISSION_REMINDER_CARD_ID                                [TBD]    │
+# │  Trigger: 催交报告 · sent to each non-submitting member                     │
+# ├──────────────────────┬──────────────────────────┬───────────────────────────┤
+# │  Button              │  Condition               │  Result                   │
+# ├──────────────────────┼──────────────────────────┼───────────────────────────┤
+# │  去填写报告           │  always                  │  link → doc / bitable     │
+# └──────────────────────┴──────────────────────────┴───────────────────────────┘
+#
+# ┌──────────────────────────────────────────────────────────────────────────────┐
+# │  WRSBOT_CONFIRM_PARTIAL_SUMMARY_CARD_ID                            [TBD]    │
+# │  Trigger: 开始周报汇总 when not all members have submitted                  │
+# ├──────────────────────┬──────────────────────────┬───────────────────────────┤
+# │  Button              │  Condition               │  Result                   │
+# ├──────────────────────┼──────────────────────────┼───────────────────────────┤
+# │  仍然开始             │  always                  │  start pipeline           │
+# │  取消                 │  always                  │  dismiss                  │
+# └──────────────────────┴──────────────────────────┴───────────────────────────┘
+#
+# ┌──────────────────────────────────────────────────────────────────────────────┐
+# │  Summarization pipeline (async — no card during processing)                 │
+# ├──────────────────────────────────────────────────────────────────────────────┤
+# │  1. Fetch reports from Bitable / Docs                                        │
+# │  2. LLM summarize → LLM rewrite (manager persona)                           │
+# │  3. ⇒ rich text reply to manager (group chat or DM)                         │
+# │  4. ⇒ WRSBOT_SUMMARY_RESULT_CARD_ID [TBD]                                   │
+# └──────────────────────────────────────────────────────────────────────────────┘
+#
+# ┌──────────────────────────────────────────────────────────────────────────────┐
+# │  WRSBOT_SUMMARY_RESULT_CARD_ID                                     [TBD]    │
+# │  Trigger: sent after summarization pipeline completes                       │
+# ├──────────────────────┬──────────────────────────┬───────────────────────────┤
+# │  Button              │  Condition               │  Result                   │
+# ├──────────────────────┼──────────────────────────┼───────────────────────────┤
+# │  写入周报文档         │  always                  │  write to doc / bitable   │
+# │  重新生成             │  always                  │  re-run pipeline          │
+# │  [TBD]               │                          │                           │
+# └──────────────────────┴──────────────────────────┴───────────────────────────┘
+#
+# ┌──────────────────────────────────────────────────────────────────────────────┐
+# │  WRSBOT_USER_DASHBOARD_CARD_ID                                     [TBD]    │
+# │  Trigger: 开始使用 · employee role                                           │
+# │  (functionality TBD)                                                        │
+# └──────────────────────────────────────────────────────────────────────────────┘
+
 import asyncio
 import json
 import os
@@ -31,12 +143,24 @@ from lark_oapi.event.callback.model.p2_card_action_trigger import (
 )
 from lark_oapi.event.callback.processor import P2CardActionTriggerProcessor
 
-# ── Card template IDs ────────────────────────────────────────────────────────
+# ──Connection Testing cards template IDs ────────────────────────────────────────────────────────
 # Set via environment variables. Default values are test card IDs.
 # Create cards in Feishu card builder and update these IDs before production.
 WELCOME_CARD_ID = os.getenv("WELCOME_CARD_ID", "AAqtuTe2kNZbb")
 ALERT_CARD_ID = os.getenv("ALERT_CARD_ID", "AAqtuTeNqRxte")
 ALERT_RESOLVED_CARD_ID = os.getenv("ALERT_RESOLVED_CARD_ID", "AAqtuTeLM56jm")
+
+# ──WRSbot cards template IDs ────────────────────────────────────────────────────────
+# Set via environment variables. Default values are test card IDs.
+WRSBOT_WELCOME_CARD_ID = os.getenv("WRSBOT_WELCOME_CARD_ID", "AAqtqD3jefquF")
+WRSBOT_BINDFOLDER_TUTORIAL_CARD_ID = os.getenv("WRSBOT_BINDFOLDER_TUTORIAL_CARD_ID", "AAqt8pubhP0Br")
+WRSBOT_BINDING_FEEDBACK_SUCCESS_CARD_ID = os.getenv("WRSBOT_BINDING_FEEDBACK_SUCCESS_CARD_ID", "AAqtVxQCOa3D8")
+WRSBOT_NOT_BINDiNG_FEEDBACK_CARD_ID = os.getenv("WRSBOT_NOT_BINDiNG_FEEDBACK_CARD_ID", "AAqtwzfERE7gi")
+WRSBOT_ADMIN_VIEW_CARD_ID = os.getenv("WRSBOT_ADMIN_VIEW_CARD_ID", "AAqtVhgEFc7gG")
+WRSBOT_ADMIN_RSCHECK_CARD_ID = os.getenv("", "AAqtVXND6ex3t") #Report Submission check. triggered when starting weekly report summary when not everyone in the department is submitted their report 
+# WRSBOT_CARD_ID = os.getenv("", "")
+# WRSBOT_CARD_ID = os.getenv("", "")
+
 
 
 class LarkCardService:
@@ -131,10 +255,13 @@ class LarkCardService:
             return P2CardActionTriggerResponse(
                 {"toast": {"type": "info", "content": "请在群聊中发送 /生成周报 指令"}}
             )
+        
+        # todo: add actions for WRSbot workflow cards
 
         return P2CardActionTriggerResponse({})
 
-    # ── Card sending ─────────────────────────────────────────────────────────
+    
+    # ── Functional testing cards sending ─────────────────────────────────────────────────────────
 
     async def send_template_card(
         self,
@@ -252,3 +379,20 @@ class LarkCardService:
             lark_client=self.lark_api,
             reply_message_id=reply_message_id,
         )
+
+
+    # ── WRSbot workflow cards sending ─────────────────────────────────────────────────────────
+
+    async def send_wrsbot_welcome(self, open_id: str) -> bool:
+        """Send wrsbot welcome card to a user by open_id"""
+        if not WRSBOT_WELCOME_CARD_ID:
+            logger.warning("[WRSbot] WRSBOT_WELCOME_CARD_ID not set, skipped sending welcome card")
+            return False
+        return await self. send_template_card(
+            "open_id", open_id, WRSBOT_WELCOME_CARD_ID,{"open_id": open_id}
+        )
+
+
+    # todo: write the workflow as comment
+    # todo: write functionalities 
+    # todo: For developer's benefit should I store all the lark cards in the directory for viewing purpose? Think about this question. 
