@@ -15,6 +15,12 @@
 #    - Report generation workflows (services/report.py)
 #==============================================================
 
+import re
+from pathlib import Path
+from dotenv import load_dotenv
+
+load_dotenv(Path(__file__).parent / ".env")
+
 from astrbot.api.event import filter, AstrMessageEvent, MessageEventResult
 from astrbot.api.star import Context, Star, register
 from astrbot.api import logger, sp
@@ -22,6 +28,8 @@ from astrbot.api.platform import MessageType
 
 from .services.lark_card import LarkCardService
 from .services.doc import DocService
+from .services.contact import ContactService
+from .utils.env_config import dump_dept_bindings
 
 
 @register("helloworld", "YourName", "一个简单的 Hello World 插件", "1.0.0")
@@ -32,6 +40,7 @@ class MyPlugin(Star):
         self.lark_api = None
         self.card_service: LarkCardService = None
         self.doc_service: DocService = None
+        self.contact_service: ContactService = None
 
     async def initialize(self):
         """Grab lark_api from the platform adapter and set up services."""
@@ -44,6 +53,9 @@ class MyPlugin(Star):
         self.card_service = LarkCardService(self.lark_api)
         self.card_service.inject_into_dispatcher(self.context.platform_manager)
         self.doc_service = DocService(self.lark_api)
+        self.contact_service = ContactService(self.lark_api)
+        await self.contact_service.start_cache()
+        self.card_service.contact_service = self.contact_service
 
 #==============================================================
 #                         Card Commands
@@ -66,7 +78,7 @@ class MyPlugin(Star):
         event._has_send_oper = True
 
     @filter.command("你好")
-    async def cmd_send_welcome(self, event: AstrMessageEvent):
+    async def cmd_send_testing_welcome(self, event: AstrMessageEvent):
         """向发送消息的用户发送欢迎卡片。"""
         from astrbot.core.platform.sources.lark.lark_event import LarkMessageEvent
 
@@ -75,6 +87,21 @@ class MyPlugin(Star):
             return
 
         await self.card_service.send_welcome_card(event.get_sender_id())
+        event._has_send_oper = True
+
+
+    # todo: trigger command need to be rewrote, maybe involking LLM to estimate user's meaning.
+    #       According to UX consideration, duo trigger might needed
+    @filter.command("Hello")
+    async def cmd_send_wrs_welcome(self, event: AstrMessageEvent):
+        """Send Welcome lark card to users"""
+        from astrbot.core.platform.sources.lark.lark_event import LarkMessageEvent
+
+        if not isinstance(event, LarkMessageEvent):
+            yield event.plain_result("This command is only abled on Lark/Feishu")
+            return
+        
+        await self.card_service.send_wrsbot_welcome(event.get_sender_id())
         event._has_send_oper = True
 
 #==============================================================
@@ -97,6 +124,7 @@ class MyPlugin(Star):
         weekly_report = f"{user_name} 的周报总结：\n- 完成了任务 A\n- 参与了会议 B\n- 学习了新技术 C"
         yield event.plain_result(weekly_report)
 
+    @filter.event_message_type(filter.EventMessageType.ALL)
     @filter.command("关于WRSbot")
     async def about_wrsbot(self, event: AstrMessageEvent):
         """这是一个关于WRSbot的指令"""
@@ -192,140 +220,84 @@ class MyPlugin(Star):
 
     @filter.command("test_feishu_contact")
     async def test_feishu_contact(self, event: AstrMessageEvent):
-        """测试飞书通讯录连接，列出根部门架构与成员角色。"""
-        from lark_oapi.api.contact.v3 import ListDepartmentRequest, ListUserRequest
-
-        platform = self.context.get_platform_inst(event.get_platform_id())
-        lark_api = getattr(platform, "lark_api", None)
-        if not lark_api:
+        """[管理员] 实时查询飞书通讯录，直接调用 API。"""
+        if not self.lark_api:
             yield event.plain_result("未找到飞书适配器，请确认当前平台为飞书。")
             return
-
-        dept_req = (
-            ListDepartmentRequest.builder()
-            .parent_department_id("0")
-            .page_size(50)
-            .build()
-        )
-        dept_resp = await lark_api.contact.v3.department.alist(dept_req)
-        if not dept_resp.success():
-            yield event.plain_result(
-                f"获取部门列表失败\ncode: {dept_resp.code}\nmsg: {dept_resp.msg}"
-            )
+        try:
+            org_tree = await self.contact_service.get_org_tree()
+        except Exception as e:
+            yield event.plain_result(f"获取部门列表失败: {e}")
             return
+        yield event.plain_result(
+            self.contact_service.format_org_tree_dump(org_tree, source="实时")
+        )
 
-        departments = dept_resp.data.items or []
-        lines = [f"══ 飞书通讯录（根部门共 {len(departments)} 个）══", ""]
+    @filter.command("test_cached_feishu_contact")
+    async def test_cached_feishu_contact(self, event: AstrMessageEvent):
+        """[Admin] 查看当前内存缓存中的部门树（不发起 API 请求）。"""
+        if not self.lark_api:
+            yield event.plain_result("未找到飞书适配器，请确认当前平台为飞书。")
+            return
+        try:
+            org_tree = await self.contact_service.get_cached_org_tree()
+        except Exception as e:
+            yield event.plain_result(f"获取缓存失败: {e}")
+            return
+        yield event.plain_result(
+            self.contact_service.format_org_tree_dump(org_tree, source="缓存")
+        )
 
-        for dept in departments:
-            dept_id = dept.department_id or ""
-            dept_open_id = getattr(dept, "open_department_id", "") or ""
-            member_count = getattr(dept, "member_count", "?")
-            lines.append(f"📁 {dept.name}  (id: {dept_id}, 成员数: {member_count})")
+    @filter.command("dump_bindings")
+    async def dump_bindings(self, event: AstrMessageEvent):
+        """[Developer] 显示所有部门文件夹绑定状态，与缓存通讯录交叉校验。"""
+        try:
+            org_tree = await self.contact_service.get_cached_org_tree()
+        except Exception as e:
+            yield event.plain_result(f"获取缓存失败: {e}")
+            return
+        yield event.plain_result(dump_dept_bindings(org_tree))
 
-            user_req = (
-                ListUserRequest.builder()
-                .department_id(dept_open_id)
-                .user_id_type("open_id")
-                .page_size(50)
-                .build()
-            )
-            user_resp = await lark_api.contact.v3.user.alist(user_req)
-
-            if not user_resp.success():
-                lines.append(f"  └─ 获取成员失败: {user_resp.msg}")
-                lines.append("")
-                continue
-
-            users = user_resp.data.items or []
-            if not users:
-                lines.append("  └─ （暂无成员）")
-            else:
-                for i, u in enumerate(users):
-                    prefix = "  └─" if i == len(users) - 1 else "  ├─"
-                    job_title = getattr(u, "job_title", "") or ""
-                    job_level = getattr(u, "job_level_name", "") or ""
-                    details = " | ".join([x for x in [job_title, job_level] if x])
-                    line = f"{prefix} {u.name}"
-                    if details:
-                        line += f"  [{details}]"
-                    lines.append(line)
-            lines.append("")
-
-        if not departments:
-            lines.append("未找到任何部门，请确认应用通讯录权限已授权。")
-
-        yield event.plain_result("\n".join(lines))
+    @filter.command("check_user")
+    async def cmd_check_user(self, event: AstrMessageEvent):
+        """转储当前发送者的飞书通讯录用户档案。"""
+        if not self.lark_api:
+            yield event.plain_result("未找到飞书适配器，请确认当前平台为飞书。")
+            return
+        yield event.plain_result(
+            await self.contact_service.get_user_profile_dump(event.get_sender_id())
+        )
 
     @filter.command("list_contacts")
     async def list_contacts(self, event: AstrMessageEvent):
         """列出飞书通讯录中所有成员（扁平列表，不含部门树）。"""
         logger.info(f"CMD HIT | msg: {repr(event.message_str)} | is_wake: {event.is_wake}")
 
-        from lark_oapi.api.contact.v3 import ListDepartmentRequest, ListUserRequest
-
-        platform = self.context.get_platform_inst(event.get_platform_id())
-        lark_api = getattr(platform, "lark_api", None)
-        if not lark_api:
+        if not self.lark_api:
             yield event.plain_result("未找到飞书适配器，请确认当前平台为飞书。")
             return
 
-        dept_req = (
-            ListDepartmentRequest.builder()
-            .parent_department_id("0")
-            .page_size(50)
-            .build()
-        )
-        dept_resp = await lark_api.contact.v3.department.alist(dept_req)
-        if not dept_resp.success():
-            yield event.plain_result(
-                f"获取部门列表失败\ncode: {dept_resp.code}\nmsg: {dept_resp.msg}"
-            )
+        try:
+            contacts, errors = await self.contact_service.list_all_members()
+        except Exception as e:
+            yield event.plain_result(f"获取部门列表失败: {e}")
             return
-
-        departments = dept_resp.data.items or []
-        if not departments:
-            yield event.plain_result("未找到任何部门，请确认应用通讯录权限已授权。")
-            return
-
-        seen = set()
-        contacts = []
-        errors = []
-
-        for dept in departments:
-            dept_open_id = getattr(dept, "open_department_id", "") or ""
-            user_req = (
-                ListUserRequest.builder()
-                .department_id(dept_open_id)
-                .user_id_type("open_id")
-                .page_size(50)
-                .build()
-            )
-            user_resp = await lark_api.contact.v3.user.alist(user_req)
-            if not user_resp.success():
-                errors.append(f"部门「{dept.name}」获取成员失败: code={user_resp.code} msg={user_resp.msg}")
-                continue
-            for u in user_resp.data.items or []:
-                if u.open_id not in seen:
-                    seen.add(u.open_id)
-                    job_title = getattr(u, "job_title", "") or ""
-                    contacts.append((u.name, job_title))
 
         if errors:
             logger.warning("list_contacts 部分部门获取失败:\n" + "\n".join(errors))
 
         if not contacts:
-            diag = f"找到 {len(departments)} 个部门，但未能获取任何成员。"
+            diag = "未能获取任何成员。"
             if errors:
                 diag += "\n\n错误详情：\n" + "\n".join(errors)
             yield event.plain_result(diag)
             return
 
         lines = [f"══ 飞书通讯录成员（共 {len(contacts)} 人）══", ""]
-        for i, (name, title) in enumerate(contacts, 1):
-            line = f"{i}. {name}"
-            if title:
-                line += f"  [{title}]"
+        for i, c in enumerate(contacts, 1):
+            line = f"{i}. {c['name']}"
+            if c["job_title"]:
+                line += f"  [{c['job_title']}]"
             lines.append(line)
 
         yield event.plain_result("\n".join(lines))
@@ -395,6 +367,55 @@ class MyPlugin(Star):
 #                       Event Listeners
 #==============================================================
 
+    # Must mirror all @filter.command handlers above.
+    # Group @mentions bypass AstrBot's command router and reach the LLM directly —
+    # this dispatcher intercepts /commands before that happens.
+    _GROUP_COMMANDS: dict = {}
+
+    @filter.event_message_type(filter.EventMessageType.GROUP_MESSAGE)
+    async def group_command_dispatcher(self, event: AstrMessageEvent):
+        """Intercept commands in group chat before the LLM pipeline runs."""
+        text = event.message_str
+        text = re.sub(r"\[At:[^\]]*\]", "", text)  # [At:ou_xxx] format
+        text = re.sub(r"@\S+", "", text)            # @WRSbot format
+        text = text.strip()
+
+        logger.debug(f"[Dispatcher] raw={repr(event.message_str)} stripped={repr(text)}")
+
+        if not text:
+            return
+
+        cmd = text.lstrip("/").split()[0]
+
+        if not self._GROUP_COMMANDS:
+            self._GROUP_COMMANDS = {
+                "whoami":                     self.cmd_whoami,
+                "关于WRSbot":                 self.about_wrsbot,
+                "helloworld":                 self.helloworld,
+                "发起告警":                   self.cmd_send_alarm,
+                "你好":                       self.cmd_send_testing_welcome,
+                "Hello":                      self.cmd_send_wrs_welcome,
+                "check_user":                 self.cmd_check_user,
+                "test_feishu_contact":        self.test_feishu_contact,
+                "test_cached_feishu_contact": self.test_cached_feishu_contact,
+                "list_contacts":              self.list_contacts,
+                "set_doc_folder":             self.set_doc_folder,
+                "test_feishu_doc":            self.test_feishu_doc,
+                "创建周报总结":               self.create_weekly_report,
+                "test_persona":               self.test_persona,
+                "set_persona":                self.set_persona,
+                "test_llm":                   self.test_llm,
+                "dump_bindings":              self.dump_bindings,
+            }
+
+        handler = self._GROUP_COMMANDS.get(cmd)
+        if handler is None:
+            return  # unknown /command — let LLM handle naturally
+
+        event.stop_event()
+        async for result in handler(event):
+            yield result
+
     @filter.event_message_type(filter.EventMessageType.ALL)
     async def on_message(self, event: AstrMessageEvent):
         text = event.message_str.strip()
@@ -421,23 +442,13 @@ class MyPlugin(Star):
 
         event.stop_event()
 
-        from lark_oapi.api.contact.v3 import GetUserRequest
-        platform = self.context.get_platform_inst(event.get_platform_id())
-        lark_api = getattr(platform, "lark_api", None)
         sender_name = event.get_sender_id()
-        if lark_api:
-            try:
-                u_req = (
-                    GetUserRequest.builder()
-                    .user_id(event.get_sender_id())
-                    .user_id_type("open_id")
-                    .build()
-                )
-                u_resp = await lark_api.contact.v3.user.aget(u_req)
-                if u_resp.success() and u_resp.data and u_resp.data.user:
-                    sender_name = u_resp.data.user.name or sender_name
-            except Exception:
-                pass
+        try:
+            user = await self.contact_service.get_user(event.get_sender_id())
+            if user:
+                sender_name = user.name or sender_name
+        except Exception:
+            pass
 
         await self.card_service.send_keyword_card(
             sender_name, matched, text, event.message_obj.message_id
@@ -465,17 +476,45 @@ class MyPlugin(Star):
     @filter.command("test_feishu_doc")
     async def test_feishu_doc(self, event: AstrMessageEvent):
         """测试飞书文档权限：列举文件（访问）、读取内容。
-        用法：/test_feishu_doc [folder_token]"""
+        用法：/test_feishu_doc [folder_token | folder_url]"""
 
         if not self.lark_api:
             yield event.plain_result("未找到飞书适配器，请确认当前平台为飞书。")
             return
 
-        inline_token = event.message_str.removeprefix("test_feishu_doc").strip().split("?")[0].strip()
-        folder_token = inline_token or await sp.get_async(scope="global", scope_id="wrsbot", key="doc_folder_token", default="") or ""
+        from .utils.env_config import extract_folder_token_from_url, set_dept_folder_token
+
+        inline_arg = event.message_str.removeprefix("test_feishu_doc").strip().split("?")[0].strip()
+
+        # Accept full Feishu folder URL or raw token
+        if inline_arg.startswith("http"):
+            folder_token = extract_folder_token_from_url(inline_arg) or ""
+        else:
+            folder_token = inline_arg or await sp.get_async(scope="global", scope_id="wrsbot", key="doc_folder_token", default="") or ""
 
         scope_label = f"指定文件夹 (token: {folder_token})" if folder_token else "机器人云空间根目录"
         lines = ["══ 飞书文档访问测试 ══", f"  目标: {scope_label}", ""]
+
+        # If a URL was given and token extracted, save to .env against the sender's dept
+        if inline_arg.startswith("http") and folder_token:
+            try:
+                org_tree = await self.contact_service.get_cached_org_tree()
+                sender_id = event.get_sender_id()
+                managed = [
+                    e for e in org_tree
+                    if e.get("manager") and e["manager"].open_id == sender_id
+                ]
+                if managed:
+                    open_dept_id = getattr(managed[0]["dept"], "open_department_id", "") or ""
+                    dept_name = managed[0]["dept"].name or open_dept_id
+                    if open_dept_id:
+                        set_dept_folder_token(open_dept_id, folder_token)
+                        lines.append(f"✅ token 已保存至 .env（部门：{dept_name}）")
+                else:
+                    lines.append("⚠️ 未找到你管理的部门，token 未保存至 .env")
+            except Exception as e:
+                lines.append(f"⚠️ 保存 token 失败: {e}")
+            lines.append("")
 
         lines.append("【1】访问测试 — 列举目标文件夹内容")
         doc_token = None
@@ -509,4 +548,4 @@ class MyPlugin(Star):
 #==============================================================
 
     async def terminate(self):
-        pass
+        self.contact_service.stop_cache()
