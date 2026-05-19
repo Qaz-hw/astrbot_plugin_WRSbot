@@ -61,6 +61,22 @@ class LarkCardService:
     def __init__(self, lark_api):
         self.lark_api = lark_api
         self.contact_service: "ContactService | None" = None
+        self._admin_pipeline_fn = None  # set by MyPlugin.initialize() via set_admin_pipeline()
+        self._user_pipeline_fn  = None  # set by MyPlugin.initialize() via set_user_pipeline()
+
+    def set_user_pipeline(self, fn) -> None:
+        """Register the async pipeline for the user view card.
+        Signature: async fn(open_id: str) -> None
+        """
+        self._user_pipeline_fn = fn
+
+    def set_admin_pipeline(self, fn) -> None:
+        """Register the async pipeline that runs submission check and sends the admin view card.
+
+        Injected by MyPlugin.initialize() so LarkCardService stays decoupled from main.py.
+        Signature: async fn(open_id: str) -> None
+        """
+        self._admin_pipeline_fn = fn
 
     # ── Dispatcher injection ─────────────────────────────────────────────────
 
@@ -211,21 +227,29 @@ class LarkCardService:
                     return P2CardActionTriggerResponse(
                         {"card": self._build_not_binding_card_data(open_id)}
                     )
+                # Pipeline is async — schedule it and return immediately with a loading toast.
+                # The pipeline will send the admin view card as a DM once data is ready.
+                if self._admin_pipeline_fn:
+                    asyncio.create_task(self._admin_pipeline_fn(open_id))
                 return P2CardActionTriggerResponse({
-                    "card": {
-                        "type": "template",
-                        "data": {
-                            "template_id": WRSBOT_ADMIN_VIEW_CARD_ID,
-                            "template_variable": {"open_id": open_id},
+                    "toast": {
+                        "type": "info",
+                        "content": "正在获取提交情况，稍后将发送管理视图卡片...",
+                        "i18n": {
+                            "zh_cn": "正在获取提交情况，稍后将发送管理视图卡片...",
+                            "en_us": "Loading submission status, admin card coming shortly...",
                         },
                     }
                 })
+            if self._user_pipeline_fn:
+                asyncio.create_task(self._user_pipeline_fn(open_id))
             return P2CardActionTriggerResponse({
-                "card": {
-                    "type": "template",
-                    "data": {
-                        "template_id": WRSBOT_CARD_USER_VIEW_ID,
-                        "template_variable": {"open_id": open_id},
+                "toast": {
+                    "type": "info",
+                    "content": "正在获取提交情况，稍后将发送用户视图卡片...",
+                    "i18n": {
+                        "zh_cn": "正在获取提交情况，稍后将发送用户视图卡片...",
+                        "en_us": "Loading your submission status...",
                     },
                 }
             })
@@ -353,6 +377,40 @@ class LarkCardService:
 
     
     # ── Functional testing cards sending ─────────────────────────────────────────────────────────
+
+    async def patch_card(self, message_id: str, card_id: str, template_variables: dict) -> bool:
+        """Replace an existing card in-place using the Feishu patch message API.
+
+        message_id: open_message_id from the card action trigger context
+        Uses the same template+variable format as send_template_card.
+        """
+        from lark_oapi.api.im.v1 import PatchMessageRequest, PatchMessageRequestBody
+
+        content = json.dumps(
+            {
+                "type": "template",
+                "data": {
+                    "template_id": card_id,
+                    "template_variable": template_variables,
+                },
+            },
+            ensure_ascii=False,
+        )
+        req = (
+            PatchMessageRequest.builder()
+            .message_id(message_id)
+            .request_body(
+                PatchMessageRequestBody.builder()
+                .content(content)
+                .build()
+            )
+            .build()
+        )
+        resp = await self.lark_api.im.v1.message.apatch(req)
+        if not resp.success():
+            logger.warning(f"[LarkCard] patch_card 失败: code={resp.code} msg={resp.msg}")
+            return False
+        return True
 
     async def send_template_card(
         self,
@@ -482,6 +540,60 @@ class LarkCardService:
             "open_id", open_id, WRSBOT_WELCOME_CARD_ID,{"open_id": open_id}
         )
 
+
+    # ── Admin view ───────────────────────────────────────────────────────────────
+
+    async def send_admin_view_card(self, open_id: str, check_result: dict, message_id: str = "") -> bool:
+        """Send the admin view card to the manager as a DM.
+
+        check_result: the dict returned by services/report.py check_submissions()
+        Template variables filled:
+          dept_name                       — department name from org tree
+          time_updated                    — when the check was run (UTC+8)
+          weekly_report_submission_status — "7/10" fraction
+          heading_colour                  — "green" (all submitted) or "yellow" (partial)
+          submitted_names                 — comma-separated submitted names
+          not_submitted_names             — comma-separated pending names
+        """
+        submitted     = check_result.get("submitted", [])
+        not_submitted = check_result.get("not_submitted", [])
+        total         = check_result.get("total", 0)
+        dept_name     = check_result.get("dept_name", "")
+        all_done      = total > 0 and len(submitted) == total
+
+        time_updated = datetime.now(timezone(timedelta(hours=8))).strftime("%Y-%m-%d %H:%M")
+        variables = {
+            "open_id":                          open_id,
+            "dept_name":                        dept_name,
+            "time_updated":                     time_updated,
+            "weekly_report_submission_status":  f"{len(submitted)}/{total}",
+            "heading_colour":                   "green" if all_done else "yellow",
+            "submitted_names":                  "、".join(submitted) or "（无）",
+            "not_submitted_names":              "、".join(not_submitted) or "（无）",
+        }
+        if message_id:
+            return await self.patch_card(message_id, WRSBOT_ADMIN_VIEW_CARD_ID, variables)
+        return await self.send_template_card("open_id", open_id, WRSBOT_ADMIN_VIEW_CARD_ID, variables)
+
+    async def send_user_view_card(self, open_id: str, dept_name: str, is_submitted: bool, message_id: str = "") -> bool:
+        """Send the user view card as a DM.
+
+        Template variables:
+          dept_name             — user's department name
+          time_updated          — when the check ran (UTC+8)
+          user_submission_status — status string in Chinese/English
+        """
+        time_updated = datetime.now(timezone(timedelta(hours=8))).strftime("%Y-%m-%d %H:%M")
+        status = "已提交！ / Submitted!" if is_submitted else "未提交，请尽快编写~ / Not yet submitted, please write soon~"
+        variables = {
+            "open_id":                open_id,
+            "dept_name":              dept_name,
+            "time_updated":           time_updated,
+            "user_submission_status": status,
+        }
+        if message_id:
+            return await self.patch_card(message_id, WRSBOT_CARD_USER_VIEW_ID, variables)
+        return await self.send_template_card("open_id", open_id, WRSBOT_CARD_USER_VIEW_ID, variables)
 
     # ── Binding status helpers (sync — reads from cached org tree) ──────────────
 

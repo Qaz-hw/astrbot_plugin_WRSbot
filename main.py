@@ -62,6 +62,8 @@ class MyPlugin(Star):
         self.contact_service = ContactService(self.lark_api)
         await self.contact_service.start_cache()
         self.card_service.contact_service = self.contact_service
+        self.card_service.set_admin_pipeline(self._admin_view_pipeline)
+        self.card_service.set_user_pipeline(self._user_view_pipeline)
 
 #==============================================================
 #                         Card Commands
@@ -407,6 +409,7 @@ class MyPlugin(Star):
                 "list_contacts":              self.list_contacts,
                 "set_doc_folder":             self.set_doc_folder,
                 "test_feishu_doc":            self.test_feishu_doc,
+                "test_weekly_file":           self.test_weekly_file,
                 "创建周报总结":               self.create_weekly_report,
                 "test_persona":               self.test_persona,
                 "set_persona":                self.set_persona,
@@ -478,6 +481,177 @@ class MyPlugin(Star):
         await sp.put_async(scope="global", scope_id="wrsbot", key="doc_folder_token", value=token)
         yield event.plain_result(f"✅ 文件夹 token 已保存：{token}\n今后直接运行 /test_feishu_doc 即可。")
 
+    async def _user_view_pipeline(self, open_id: str) -> None:
+        """Async pipeline for the user view card.
+
+        Finds this week's file → runs submission check → checks if this
+        user's name is in the submitted list → sends user view card as DM.
+        """
+        from .services.report import check_submissions
+        from .utils.env_config import get_dept_folder_token
+        from datetime import datetime, timedelta
+
+        try:
+            org_tree = await self.contact_service.get_cached_org_tree()
+
+            # Find which dept this user belongs to
+            dept_entry = None
+            for entry in org_tree:
+                if any(getattr(m, "open_id", None) == open_id for m in entry.get("members", [])):
+                    dept_entry = entry
+                    break
+
+            if not dept_entry:
+                logger.warning(f"[UserView] 未找到所属部门: open_id={open_id}")
+                return
+
+            dept      = dept_entry["dept"]
+            dept_name = dept.name or ""
+            open_dept_id = getattr(dept, "open_department_id", "") or ""
+            folder_token = get_dept_folder_token(open_dept_id)
+            if not folder_token:
+                logger.warning(f"[UserView] 文件夹未绑定: dept={dept_name}")
+                return
+
+            # Find this week's file/table
+            files = await self.drive_service.list_folder_files(folder_token)
+            weekly_file: dict | None = None
+
+            bitable_files = [f for f in files if f["type"] == "bitable"]
+            if bitable_files and self.bitable_service:
+                today  = datetime.now().date()
+                monday = today - timedelta(days=today.weekday())
+                year, week, _ = monday.isocalendar()
+                iso_tag = f"{year}-W{week:02d}"
+                tables  = await self.bitable_service.list_tables(bitable_files[0]["token"])
+                matched = next((t for t in tables if iso_tag in t["name"]), None)
+                if matched:
+                    weekly_file = {
+                        **bitable_files[0],
+                        "table_id":   matched["table_id"],
+                        "table_name": matched["name"],
+                    }
+
+            if not weekly_file:
+                weekly_file = await self.drive_service.find_this_week_file(folder_token)
+
+            if not weekly_file:
+                logger.warning(f"[UserView] 未找到本周文件: folder={folder_token}")
+                return
+
+            if not self.bitable_service:
+                return
+            provider = self.context.get_using_provider(umo=f"lark:open_id:{open_id}")
+            if not provider:
+                return
+
+            result = await check_submissions(
+                weekly_file=weekly_file,
+                sender_id=open_id,
+                contact_service=self.contact_service,
+                doc_service=self.doc_service,
+                bitable_service=self.bitable_service,
+                llm_provider=provider,
+                session_id=f"wrsbot_user:{open_id}",
+            )
+
+            if not result["ok"]:
+                logger.warning(f"[UserView] 提交检查失败: {result['error']}")
+                return
+
+            # Check if this user's name appears in the submitted list
+            user_name    = next(
+                (m.name for m in dept_entry.get("members", []) if getattr(m, "open_id", None) == open_id),
+                "",
+            )
+            is_submitted = user_name in result["submitted"]
+
+            await self.card_service.send_user_view_card(open_id, dept_name, is_submitted)
+
+        except Exception as e:
+            logger.error(f"[UserView] 用户视图加载失败: {e}")
+
+    async def _admin_view_pipeline(self, open_id: str) -> None:
+        """Async pipeline triggered by wrsbot_start card action for admin users.
+
+        Resolves the manager's dept folder → finds this week's file/table →
+        runs submission check → sends the admin view card as a DM.
+        Runs via asyncio.create_task() so the sync card handler returns immediately.
+        """
+        from .services.report import check_submissions
+        from .utils.env_config import get_dept_folder_token
+        from datetime import datetime, timedelta
+
+        try:
+            org_tree = await self.contact_service.get_cached_org_tree()
+            managed = [
+                e for e in org_tree
+                if e.get("manager") and e["manager"].open_id == open_id
+            ]
+            if not managed:
+                logger.warning(f"[AdminView] 未找到管理的部门: open_id={open_id}")
+                return
+
+            dept = managed[0]["dept"]
+            open_dept_id = getattr(dept, "open_department_id", "") or ""
+            folder_token = get_dept_folder_token(open_dept_id)
+            if not folder_token:
+                logger.warning(f"[AdminView] 文件夹未绑定: dept={dept.name}")
+                return
+
+            # ── Find this week's file/table ──────────────────────────────────
+            files = await self.drive_service.list_folder_files(folder_token)
+            weekly_file: dict | None = None
+
+            bitable_files = [f for f in files if f["type"] == "bitable"]
+            if bitable_files and self.bitable_service:
+                today = datetime.now().date()
+                monday = today - timedelta(days=today.weekday())
+                year, week, _ = monday.isocalendar()
+                iso_tag = f"{year}-W{week:02d}"
+                tables = await self.bitable_service.list_tables(bitable_files[0]["token"])
+                matched = next((t for t in tables if iso_tag in t["name"]), None)
+                if matched:
+                    weekly_file = {
+                        **bitable_files[0],
+                        "table_id":   matched["table_id"],
+                        "table_name": matched["name"],
+                    }
+
+            if not weekly_file:
+                weekly_file = await self.drive_service.find_this_week_file(folder_token)
+
+            if not weekly_file:
+                logger.warning(f"[AdminView] 未找到本周文件: folder={folder_token}")
+                return
+
+            # ── Submission check ─────────────────────────────────────────────
+            if not self.bitable_service:
+                return
+            provider = self.context.get_using_provider(umo=f"lark:open_id:{open_id}")
+            if not provider:
+                logger.warning(f"[AdminView] 无可用 LLM 提供者")
+                return
+
+            result = await check_submissions(
+                weekly_file=weekly_file,
+                sender_id=open_id,
+                contact_service=self.contact_service,
+                doc_service=self.doc_service,
+                bitable_service=self.bitable_service,
+                llm_provider=provider,
+                session_id=f"wrsbot_admin:{open_id}",
+            )
+
+            if not result["ok"]:
+                logger.warning(f"[AdminView] 提交检查失败: {result['error']}")
+                return
+
+            await self.card_service.send_admin_view_card(open_id, result)
+
+        except Exception as e:
+            logger.error(f"[AdminView] 管理员视图加载失败: {e}")
+
     @filter.command("test_feishu_doc")
     async def test_feishu_doc(self, event: AstrMessageEvent):
         """测试飞书文档权限：列举文件、读取内容、识别本周文件。
@@ -486,6 +660,15 @@ class MyPlugin(Star):
             yield event.plain_result("未找到飞书适配器，请确认当前平台为飞书。")
             return
         yield event.plain_result(await _DocTestRunner(self).run(event))
+
+    @filter.command("test_weekly_file")
+    async def test_weekly_file(self, event: AstrMessageEvent):
+        """测试本周文件/表格识别逻辑（Bitable 表格匹配 + Doc 文件名匹配）。
+        用法：/test_weekly_file [folder_token | folder_url]"""
+        if not self.lark_api:
+            yield event.plain_result("未找到飞书适配器，请确认当前平台为飞书。")
+            return
+        yield event.plain_result(await _WeeklyFileTestRunner(self).run(event))
 
 #==============================================================
 #                          Lifecycle
@@ -642,17 +825,81 @@ class _DocTestRunner:
         return lines
 
     async def _step_find_weekly(self, event: AstrMessageEvent, folder_token: str) -> list[str]:
-        lines = ["", "【3】本周文件识别 — 规则匹配 + LLM 兜底"]
+        """Step 3 — locate this week's report source.
+
+        Two strategies depending on what's in the folder:
+
+        Bitable: one persistent file per dept folder, tables named by ISO week
+                 (e.g. "2026-W21"). Bot finds the bitable by file type, then
+                 finds this week's table by name match inside it.
+
+        Doc:     one file per week, named with ISO week or date range.
+                 Bot scans the folder for a matching filename, with LLM fallback.
+                 # NOTE: if departments use a non-standard naming convention,
+                 # update match_this_week() in services/drive.py to add new patterns,
+                 # or adjust the LLM prompt in _make_llm_fn().
+        """
+        from datetime import datetime, timedelta
+
+        lines = ["", "【3】本周文件/表格识别"]
         self._last_weekly_file = None
+
         if not folder_token:
             lines.append("  ⚠️ 跳过：未提供文件夹 token")
             return lines
+
+        today = datetime.now().date()
+        monday = today - timedelta(days=today.weekday())
+        year, week, _ = monday.isocalendar()
+        iso_tag = f"{year}-W{week:02d}"
+
+        try:
+            files = await self.plugin.drive_service.list_folder_files(folder_token)
+        except Exception as e:
+            lines.append(f"  ❌ 列举文件夹失败: {e}")
+            return lines
+
+        # ── Bitable strategy ─────────────────────────────────────────────────
+        # Dept keeps one persistent bitable in the folder; each week is a table
+        # inside it named by ISO week (e.g. "2026-W21").
+        bitable_files = [f for f in files if f["type"] == "bitable"]
+        if bitable_files:
+            bitable_file = bitable_files[0]   # one bitable per dept folder
+            lines.append(f"  📊 Bitable 文件: 「{bitable_file['name']}」")
+            try:
+                bitable = self.plugin.bitable_service
+                if not bitable:
+                    lines.append("  ❌ BitableService 未初始化")
+                    return lines
+                tables = await bitable.list_tables(bitable_file["token"])
+                matched = next((t for t in tables if iso_tag in t["name"]), None)
+                if matched:
+                    self._last_weekly_file = {
+                        **bitable_file,
+                        "table_id":   matched["table_id"],
+                        "table_name": matched["name"],
+                    }
+                    lines.append(
+                        f"  ✅ 本周表格: 「{matched['name']}」  table_id={matched['table_id']}"
+                    )
+                else:
+                    all_names = [t["name"] for t in tables]
+                    lines.append(
+                        f"  ⚠️ 未找到本周表格（{iso_tag}），现有表格: {all_names}"
+                    )
+            except Exception as e:
+                lines.append(f"  ❌ 读取 Bitable 表格列表失败: {e}")
+            return lines
+
+        # ── Doc strategy ─────────────────────────────────────────────────────
+        # One doc file per week; identified by ISO week or date-range in filename.
+        # LLM fallback fires only when neither pattern matches.
         try:
             found = await self.plugin.drive_service.find_this_week_file(
                 folder_token, llm_fn=self._make_llm_fn(event)
             )
             if found:
-                self._last_weekly_file = found
+                self._last_weekly_file = {**found, "table_id": None, "table_name": None}
                 lines.append(
                     f"  ✅ 找到本周文件: 「{found['name']}」  type={found['type']}  token={found['token']}"
                 )
@@ -663,9 +910,8 @@ class _DocTestRunner:
         return lines
 
     async def _step_submission_check(self, event: AstrMessageEvent) -> list[str]:
-        """Step 4 — read this week's file content, get dept members, ask LLM who submitted."""
-        import json
-        from .prompts.submission_check import build_submission_check_prompt
+        """Step 4 — delegate to check_submissions() in services/report.py, then format for display."""
+        from .services.report import check_submissions
 
         lines = ["", "【4】提交情况检查 — 成员 vs 周报内容"]
 
@@ -673,90 +919,190 @@ class _DocTestRunner:
             lines.append("  ⚠️ 跳过：第3步未找到本周文件")
             return lines
 
-        file = self._last_weekly_file
-        file_type = file["type"]
-        file_token = file["token"]
-
-        # ── Read file content ────────────────────────────────────────────────
-        content = ""
-        try:
-            if file_type == "bitable":
-                bitable = self.plugin.bitable_service
-                if not bitable:
-                    lines.append("  ❌ BitableService 未初始化")
-                    return lines
-                tables = await bitable.list_tables(file_token)
-                if not tables:
-                    lines.append("  ❌ Bitable 无可用表格")
-                    return lines
-                table_id = tables[0]["table_id"]
-                records = await bitable.list_records(file_token, table_id)
-                content = bitable.records_to_text(records)
-                lines.append(f"  📋 Bitable: 共 {len(records)} 条记录（表格：{tables[0]['name'] or table_id}）")
-            elif file_type in ("docx", "doc"):
-                content = await self.plugin.doc_service.read_doc_plaintext(file_token)
-                lines.append(f"  📄 Doc: 读取成功，{len(content)} 字符")
-            else:
-                lines.append(f"  ⚠️ 跳过：不支持的文件类型 {file_type!r}")
-                return lines
-        except Exception as e:
-            lines.append(f"  ❌ 读取文件内容失败: {e}")
-            return lines
-
-        # ── Get dept members from org tree ───────────────────────────────────
-        sender_id = event.get_sender_id()
-        members: list[dict] = []
-        try:
-            org_tree = await self.plugin.contact_service.get_cached_org_tree()
-            for entry in org_tree:
-                in_dept = any(
-                    getattr(m, "open_id", None) == sender_id
-                    for m in entry.get("members", [])
-                )
-                if in_dept:
-                    members = [
-                        {
-                            "name": m.name or "",
-                            "open_id": m.open_id or "",
-                            "job_title": getattr(m, "job_title", "") or "",
-                        }
-                        for m in entry.get("members", [])
-                    ]
-                    dept_name = entry["dept"].name or ""
-                    lines.append(f"  👥 部门：{dept_name}，共 {len(members)} 名成员")
-                    break
-        except Exception as e:
-            lines.append(f"  ❌ 获取部门成员失败: {e}")
-            return lines
-
-        if not members:
-            lines.append("  ⚠️ 未找到你所属的部门成员，无法检查提交情况")
-            return lines
-
-        # ── Ask LLM ─────────────────────────────────────────────────────────
-        prompt = build_submission_check_prompt(members, content, file_type)
         provider = self.plugin.context.get_using_provider(umo=event.unified_msg_origin)
         if not provider:
             lines.append("  ❌ 无可用 LLM 提供者")
             return lines
 
-        try:
-            resp = await provider.text_chat(prompt=prompt, session_id=event.unified_msg_origin)
-            raw = resp.completion_text.strip()
-            result = json.loads(raw)
-            submitted     = result.get("submitted", [])
-            not_submitted = result.get("not_submitted", [])
-        except (json.JSONDecodeError, Exception) as e:
-            lines.append(f"  ❌ LLM 解析失败: {e}\n  原始回复: {getattr(resp, 'completion_text', '')[:200]}")
+        if not self.plugin.bitable_service:
+            lines.append("  ❌ BitableService 未初始化")
             return lines
 
-        total = len(members)
-        lines.append(f"  ✅ 已提交 ({len(submitted)}/{total})：{', '.join(submitted) or '（无）'}")
-        lines.append(f"  ❌ 未提交 ({len(not_submitted)}/{total})：{', '.join(not_submitted) or '（无）'}")
+        r = await check_submissions(
+            weekly_file=self._last_weekly_file,
+            sender_id=event.get_sender_id(),
+            contact_service=self.plugin.contact_service,
+            doc_service=self.plugin.doc_service,
+            bitable_service=self.plugin.bitable_service,
+            llm_provider=provider,
+            session_id=event.unified_msg_origin,
+        )
+
+        if not r["ok"]:
+            lines.append(f"  ❌ {r['error']}")
+            return lines
+
+        file_type  = r["file_type"]
+        table_name = self._last_weekly_file.get("table_name", "")
+        if file_type == "bitable":
+            lines.append(f"  📋 Bitable: 共 {len(r['members'])} 条记录（表格：{table_name}）")
+        else:
+            lines.append(f"  📄 Doc: 读取成功（{file_type}）")
+
+        lines.append(f"  👥 部门：{r['dept_name']}，共 {r['total']} 名成员")
+        lines.append(f"  ✅ 已提交 ({len(r['submitted'])}/{r['total']})：{', '.join(r['submitted']) or '（无）'}")
+        lines.append(f"  ❌ 未提交 ({len(r['not_submitted'])}/{r['total']})：{', '.join(r['not_submitted']) or '（无）'}")
         return lines
 
     def _make_llm_fn(self, event: AstrMessageEvent):
         """Return an async callable that asks the LLM to pick the best file name from a list."""
+        plugin = self.plugin
+
+        async def _llm_pick(names: list[str]) -> str | None:
+            from datetime import datetime as _dt
+            today = _dt.now()
+            _, week, _ = today.isocalendar()
+            prompt = (
+                f"今天是 {today.strftime('%Y-%m-%d')}（第 {week} 周）。"
+                f"以下是飞书文件夹中的文件名列表：\n"
+                + "\n".join(f"- {n}" for n in names)
+                + "\n\n哪个文件最可能是本周的周报？请只回复文件名，不要添加其他内容。如果都不像，请回复 none。"
+            )
+            provider = plugin.context.get_using_provider(umo=event.unified_msg_origin)
+            if not provider:
+                return None
+            resp = await provider.text_chat(prompt=prompt, session_id=event.unified_msg_origin)
+            chosen = resp.completion_text.strip().strip('"').strip("'")
+            return chosen if chosen.lower() != "none" else None
+
+        return _llm_pick
+
+
+class _WeeklyFileTestRunner:
+    """Focused test for /test_weekly_file — only checks file/table discovery, no content reads."""
+
+    def __init__(self, plugin: "MyPlugin"):
+        self.plugin = plugin
+
+    async def run(self, event: AstrMessageEvent) -> str:
+        from .utils.env_config import extract_folder_token_from_url
+
+        inline_arg = event.message_str.removeprefix("test_weekly_file").strip().split("?")[0].strip()
+
+        if inline_arg.startswith("http"):
+            folder_token = extract_folder_token_from_url(inline_arg) or ""
+            source_label = f"URL 参数 (token: {folder_token})"
+        elif inline_arg:
+            folder_token = inline_arg
+            source_label = f"手动参数 (token: {folder_token})"
+        else:
+            folder_token, source_label = await self._resolve_folder_token(event)
+
+        lines = ["══ 本周文件识别测试 ══", f"  目标: {source_label}", ""]
+
+        if not folder_token:
+            lines.append("❌ 无法继续：未找到文件夹 token。")
+            lines.append("   请通过 /test_weekly_file <folder_url> 直接传入，或先完成部门绑定。")
+            return "\n".join(lines)
+
+        from datetime import datetime, timedelta
+        today = datetime.now().date()
+        monday = today - timedelta(days=today.weekday())
+        year, week, _ = monday.isocalendar()
+        iso_tag = f"{year}-W{week:02d}"
+        lines.append(f"  本周 ISO 标签: {iso_tag}  (本周一: {monday})")
+        lines.append("")
+
+        # ── List all files ───────────────────────────────────────────────────
+        try:
+            files = await self.plugin.drive_service.list_folder_files(folder_token)
+        except Exception as e:
+            lines.append(f"❌ 文件夹列举失败: {e}")
+            return "\n".join(lines)
+
+        lines.append(f"【文件夹内容】共 {len(files)} 个条目")
+        for f in files:
+            lines.append(f"  [{f['type']:8s}] {f['name']}  token={f['token']}")
+        lines.append("")
+
+        # ── Bitable strategy ─────────────────────────────────────────────────
+        lines.append("【Bitable 策略】")
+        bitable_files = [f for f in files if f["type"] == "bitable"]
+        if not bitable_files:
+            lines.append("  — 文件夹内无 Bitable 文件，跳过")
+        else:
+            bitable_file = bitable_files[0]
+            lines.append(f"  📊 Bitable 文件: 「{bitable_file['name']}」  token={bitable_file['token']}")
+            bitable = self.plugin.bitable_service
+            if not bitable:
+                lines.append("  ❌ BitableService 未初始化")
+            else:
+                try:
+                    tables = await bitable.list_tables(bitable_file["token"])
+                    lines.append(f"  所有表格 ({len(tables)} 个):")
+                    for t in tables:
+                        tag = "  ◀ 本周" if iso_tag in t["name"] else ""
+                        lines.append(f"    - 「{t['name']}」  id={t['table_id']}{tag}")
+                    matched = next((t for t in tables if iso_tag in t["name"]), None)
+                    if matched:
+                        lines.append(f"  ✅ 匹配: 「{matched['name']}」  table_id={matched['table_id']}")
+                    else:
+                        lines.append(f"  ⚠️ 未找到含 {iso_tag!r} 的表格")
+                except Exception as e:
+                    lines.append(f"  ❌ 读取表格列表失败: {e}")
+        lines.append("")
+
+        # ── Doc strategy ─────────────────────────────────────────────────────
+        lines.append("【Doc 策略】")
+        doc_files = [f for f in files if f["type"] in ("docx", "doc")]
+        if not doc_files:
+            lines.append("  — 文件夹内无 Doc/Docx 文件，跳过")
+        else:
+            from .services.drive import DriveService
+            rule_match = DriveService.match_this_week(doc_files)
+            if rule_match:
+                lines.append(f"  ✅ 规则匹配: 「{rule_match['name']}」  type={rule_match['type']}")
+            else:
+                lines.append(f"  — 规则未匹配（检查了 {len(doc_files)} 个文件），尝试 LLM 回退…")
+                try:
+                    found = await self.plugin.drive_service.find_this_week_file(
+                        folder_token, llm_fn=self._make_llm_fn(event)
+                    )
+                    if found:
+                        lines.append(f"  ✅ LLM 匹配: 「{found['name']}」  type={found['type']}")
+                    else:
+                        lines.append("  ⚠️ LLM 也未能识别本周文件")
+                except Exception as e:
+                    lines.append(f"  ❌ LLM 回退失败: {e}")
+
+        return "\n".join(lines)
+
+    async def _resolve_folder_token(self, event: AstrMessageEvent) -> tuple[str, str]:
+        from .utils.env_config import get_dept_folder_token
+        sender_id = event.get_sender_id()
+        try:
+            org_tree = await self.plugin.contact_service.get_cached_org_tree()
+        except Exception as e:
+            return "", f"未知（通讯录缓存未就绪: {e}）"
+
+        for entry in org_tree:
+            in_dept = any(
+                getattr(m, "open_id", None) == sender_id
+                for m in entry.get("members", [])
+            )
+            if not in_dept:
+                continue
+            dept = entry["dept"]
+            open_dept_id = getattr(dept, "open_department_id", "") or ""
+            dept_name = dept.name or open_dept_id
+            token = get_dept_folder_token(open_dept_id)
+            if token:
+                return token, f"{dept_name} 部门（.env 自动匹配，token: {token}）"
+            return "", f"{dept_name} 部门（未绑定文件夹）"
+
+        return "", f"未在通讯录中找到你所属的部门（open_id: {sender_id}）"
+
+    def _make_llm_fn(self, event: AstrMessageEvent):
         plugin = self.plugin
 
         async def _llm_pick(names: list[str]) -> str | None:
