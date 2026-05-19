@@ -19,6 +19,8 @@ from lark_oapi.api.bitable.v1 import (
     ListAppTableRequest,
     ListAppTableFieldRequest,
     ListAppTableRecordRequest,
+    UpdateAppTableRecordRequest,
+    AppTableRecord,
 )
 from astrbot.api import logger
 
@@ -93,6 +95,47 @@ class BitableService:
 
         logger.debug(f"[Bitable] list_records: app={app_token} table={table_id} → {len(records)} 条记录")
         return records
+
+    async def find_summary_record(self, app_token: str, table_id: str) -> str | None:
+        """Find the record_id of the '部门总结' row in a weekly table.
+
+        Scans all records and returns the record_id of the first one whose
+        fields contain a value that includes '部门总结'. Returns None if not found.
+        """
+        records = await self.list_records(app_token, table_id)
+        for rec in records:
+            for val in rec["fields"].values():
+                text = ""
+                if isinstance(val, str):
+                    text = val
+                elif isinstance(val, dict):
+                    text = val.get("text") or val.get("name") or ""
+                elif isinstance(val, list) and val:
+                    first = val[0]
+                    text = first.get("text") or first.get("name") or "" if isinstance(first, dict) else str(first)
+                if "部门总结" in text:
+                    logger.debug(f"[Bitable] 找到部门总结行: record_id={rec['record_id']}")
+                    return rec["record_id"]
+        logger.warning(f"[Bitable] 未找到部门总结行: app={app_token} table={table_id}")
+        return None
+
+    async def update_record(self, app_token: str, table_id: str, record_id: str, fields: dict) -> None:
+        """Update a single record's fields in a Bitable table."""
+        body = AppTableRecord.builder().fields(fields).build()
+        req = (
+            UpdateAppTableRecordRequest.builder()
+            .app_token(app_token)
+            .table_id(table_id)
+            .record_id(record_id)
+            .request_body(body)
+            .build()
+        )
+        resp = await self.lark_api.bitable.v1.app_table_record.aupdate(req)
+        if not resp.success():
+            raise RuntimeError(
+                f"[Bitable] update_record 失败: code={resp.code} msg={resp.msg}"
+            )
+        logger.debug(f"[Bitable] update_record: record_id={record_id} fields={list(fields.keys())}")
 
     @staticmethod
     def records_to_text(records: list[dict]) -> str:

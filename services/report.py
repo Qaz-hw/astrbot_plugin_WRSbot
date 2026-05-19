@@ -19,7 +19,6 @@
 #
 #  Does NOT contain:
 #    - Raw Feishu API calls (delegated to BitableService / DocService)
-#    - Prompt text (lives in prompts/)
 #    - Card definitions (lives in services/lark_card.py)
 #=====================================================
 
@@ -28,7 +27,94 @@ from astrbot.api import logger
 from .bitable import BitableService
 from .doc import DocService
 from .contact import ContactService
-from ..prompts.submission_check import build_submission_check_prompt
+
+
+# ── Prompt builders ─────────────────────────────────────────────────────────
+# Kept private to this module — they're only called by the public functions
+# below (check_submissions / summarize_reports / rewrite_summary).
+
+def _build_submission_check_prompt(members: list[dict], content: str, file_type: str) -> str:
+    member_lines = "\n".join(
+        f"- {m['name']}" + (f"（{m['job_title']}）" if m.get("job_title") else "")
+        for m in members
+    )
+    format_hint = (
+        "多维表格（每条 [记录 N] 代表一份提交，字段名和值已展开）"
+        if file_type == "bitable"
+        else "飞书文档纯文本（各成员报告可能以姓名、章节或段落区分）"
+    )
+    return (
+        f"以下是本部门本周应提交周报的成员列表：\n"
+        f"{member_lines}\n\n"
+        f"以下是本周周报文件的内容（格式：{format_hint}）：\n"
+        f"---\n{content}\n---\n\n"
+        f"请根据文件内容，判断以上每位成员是否已提交本周周报。\n"
+        f"匹配规则：\n"
+        f"  - 以成员姓名为主要匹配依据\n"
+        f"  - 若文件中出现该成员姓名且有对应内容，视为已提交\n"
+        f"  - 若无法确认，归入未提交\n\n"
+        f"仅以以下 JSON 格式回复，不要添加任何解释或其他内容：\n"
+        f'{{"submitted": ["姓名A", "姓名B"], "not_submitted": ["姓名C"]}}'
+    )
+
+
+_SUMMARIZE_SYSTEM = """你是一名企业部门周报汇总助手。
+你的任务是将多名成员的个人周报整合成一份结构清晰的部门周报草稿。
+
+输出规则：
+- 严格按照以下四个章节输出，不得增删章节
+- 章节标题只允许使用加粗字体
+- 每个章节列出2~6条要点，每条以「- 」开头
+- 只使用原文提供的信息，不得虚构或推断不存在的内容
+- 不要在输出中提及成员姓名，只呈现工作内容
+- 不使用"总体来说"、"首先其次"、"在当今"等 AI 习惯用语
+- 语言简洁客观，使用职场用语：推进、落地、对齐、复盘、跟进、输出、闭环
+
+输出格式（严格遵守）：
+本周KPI与业务进展
+- ...
+
+重点项目进展
+- ...
+
+风险与阻塞项
+- ...
+
+下周计划
+- ..."""
+
+
+def _build_summarize_prompt(content: str, dept_name: str, iso_week: str) -> tuple[str, str]:
+    user = (
+        f"以下是【{dept_name}】{iso_week} 的全体成员周报内容：\n\n"
+        f"---\n{content}\n---\n\n"
+        f"请按照四章节格式，输出部门周报汇总草稿。"
+    )
+    return _SUMMARIZE_SYSTEM, user
+
+
+_REWRITE_SYSTEM = """你是一名企业报告润色编辑。
+你的任务是将结构化的周报草稿改写为专业的管理层汇报风格。
+
+改写规则：
+- 保留草稿的所有事实内容，不得删减或虚构
+- 语言简洁、客观、职场化，避免口语和学术腔
+- 禁止使用以下表达：总体来说、综上所述、首先其次最后、在当今、值得注意的是
+- 优先使用以下职场词汇：推进、落地、对齐、复盘、跟进、输出、闭环、拉齐
+- 段落精炼，每条要点不超过两句话
+- 保持原有的四章节结构（## 标题格式不变）"""
+
+
+def _build_rewrite_prompt(draft: str, style_input: str = "") -> tuple[str, str]:
+    style_section = ""
+    if style_input.strip():
+        style_section = f"额外改写要求（优先执行）：{style_input.strip()}\n\n"
+    user = (
+        f"{style_section}"
+        f"请将以下周报草稿按照上述规则进行改写：\n\n"
+        f"---\n{draft}\n---"
+    )
+    return _REWRITE_SYSTEM, user
 
 
 async def check_submissions(
@@ -132,7 +218,7 @@ async def check_submissions(
     result["total"]     = len(members)
 
     # ── LLM submission check ─────────────────────────────────────────────────
-    prompt = build_submission_check_prompt(members, content, file_type)
+    prompt = _build_submission_check_prompt(members, content, file_type)
     resp   = None
 
     try:
@@ -159,6 +245,49 @@ async def check_submissions(
         result["error"] = f"LLM 调用失败: {e}"
 
     return result
+
+
+async def summarize_reports(
+    content: str,
+    dept_name: str,
+    iso_week: str,
+    llm_provider,
+    session_id: str,
+) -> str:
+    """LLM pass 1 — summarize raw report content into a structured 4-section draft.
+
+    content:   serialized text of bitable records or doc blocks
+    iso_week:  e.g. "2026-W21"
+    Returns the LLM's completion text (structured markdown draft).
+    """
+    sys_p, usr_p = _build_summarize_prompt(content, dept_name, iso_week)
+    resp = await llm_provider.text_chat(
+        prompt=usr_p,
+        system_prompt=sys_p,
+        session_id=session_id,
+    )
+    return resp.completion_text.strip()
+
+
+async def rewrite_summary(
+    draft: str,
+    llm_provider,
+    session_id: str,
+    style_input: str = "",
+) -> str:
+    """LLM pass 2 — rewrite a structured draft into polished managerial style.
+
+    draft:       output from summarize_reports()
+    style_input: optional free-form style instructions from the manager
+    Returns the final polished report text.
+    """
+    sys_p, usr_p = _build_rewrite_prompt(draft, style_input)
+    resp = await llm_provider.text_chat(
+        prompt=usr_p,
+        system_prompt=sys_p,
+        session_id=session_id,
+    )
+    return resp.completion_text.strip()
 
 
 ## ReportService (not yet implemented)

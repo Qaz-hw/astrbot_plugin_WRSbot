@@ -61,22 +61,30 @@ class LarkCardService:
     def __init__(self, lark_api):
         self.lark_api = lark_api
         self.contact_service: "ContactService | None" = None
-        self._admin_pipeline_fn = None  # set by MyPlugin.initialize() via set_admin_pipeline()
-        self._user_pipeline_fn  = None  # set by MyPlugin.initialize() via set_user_pipeline()
+        self._admin_pipeline_fn    = None
+        self._user_pipeline_fn     = None
+        self._generate_pipeline_fn = None
+        self._rewrite_pipeline_fn  = None
+        self._submit_pipeline_fn   = None
 
     def set_user_pipeline(self, fn) -> None:
-        """Register the async pipeline for the user view card.
-        Signature: async fn(open_id: str) -> None
-        """
+        """Signature: async fn(open_id: str) -> None"""
         self._user_pipeline_fn = fn
 
     def set_admin_pipeline(self, fn) -> None:
-        """Register the async pipeline that runs submission check and sends the admin view card.
-
-        Injected by MyPlugin.initialize() so LarkCardService stays decoupled from main.py.
-        Signature: async fn(open_id: str) -> None
-        """
+        """Signature: async fn(open_id: str) -> None"""
         self._admin_pipeline_fn = fn
+
+    def set_report_pipelines(self, *, generate, rewrite, submit) -> None:
+        """Register the three report generation pipelines.
+
+        generate: async fn(open_id: str) -> None
+        rewrite:  async fn(open_id: str, style_input: str) -> None
+        submit:   async fn(open_id: str) -> None
+        """
+        self._generate_pipeline_fn = generate
+        self._rewrite_pipeline_fn  = rewrite
+        self._submit_pipeline_fn   = submit
 
     # ── Dispatcher injection ─────────────────────────────────────────────────
 
@@ -116,6 +124,11 @@ class LarkCardService:
         open_id: str = (
             data.event.operator.open_id or ""
             if data.event.operator is not None
+            else ""
+        )
+        message_id: str = (
+            data.event.context.open_message_id or ""
+            if data.event.context is not None
             else ""
         )
 
@@ -230,7 +243,7 @@ class LarkCardService:
                 # Pipeline is async — schedule it and return immediately with a loading toast.
                 # The pipeline will send the admin view card as a DM once data is ready.
                 if self._admin_pipeline_fn:
-                    asyncio.create_task(self._admin_pipeline_fn(open_id))
+                    asyncio.create_task(self._admin_pipeline_fn(open_id, message_id))
                 return P2CardActionTriggerResponse({
                     "toast": {
                         "type": "info",
@@ -242,7 +255,7 @@ class LarkCardService:
                     }
                 })
             if self._user_pipeline_fn:
-                asyncio.create_task(self._user_pipeline_fn(open_id))
+                asyncio.create_task(self._user_pipeline_fn(open_id, message_id))
             return P2CardActionTriggerResponse({
                 "toast": {
                     "type": "info",
@@ -373,6 +386,51 @@ class LarkCardService:
                 "card": self._build_not_binding_card_data(open_id),
             })
 
+        # ── Report generation actions ─────────────────────────────────────────
+
+        # Triggered from admin view card. Kicks off the full generation pipeline:
+        # read content → LLM summarize → LLM rewrite → send text DM + action card.
+        if action_key == "start_summary":
+            logger.info("[Lark_card] 开始生成周报总结")
+            if self._generate_pipeline_fn:
+                asyncio.create_task(self._generate_pipeline_fn(open_id, message_id))
+            return P2CardActionTriggerResponse({"card": {"type": "raw", "data": _GENERATING_CARD}})
+
+        # style_input: free-form style instructions from the manager's text input.
+        # Reruns only the rewrite pass against the draft stored in sp.
+        if action_key == "rewrite_summary":
+            logger.info("[Lark_card] 重新改写周报总结")
+            form_value: dict = action.form_value or {} if action is not None else {}
+            style_input = str(form_value.get("style_input", "")).strip()
+            if self._rewrite_pipeline_fn:
+                asyncio.create_task(self._rewrite_pipeline_fn(open_id, style_input))
+            return P2CardActionTriggerResponse({
+                "toast": {
+                    "type": "info",
+                    "content": "正在改写，完成后将发送新版本...",
+                    "i18n": {
+                        "zh_cn": "正在改写，完成后将发送新版本...",
+                        "en_us": "Rewriting, new version coming shortly...",
+                    },
+                }
+            })
+
+        # Reads the draft from sp and writes it to bitable 部门总结 row.
+        if action_key == "submit_summary":
+            logger.info("[Lark_card] 写入周报总结到文件")
+            if self._submit_pipeline_fn:
+                asyncio.create_task(self._submit_pipeline_fn(open_id))
+            return P2CardActionTriggerResponse({
+                "toast": {
+                    "type": "info",
+                    "content": "正在写入，请稍候...",
+                    "i18n": {
+                        "zh_cn": "正在写入，请稍候...",
+                        "en_us": "Writing to file, please wait...",
+                    },
+                }
+            })
+
         return P2CardActionTriggerResponse({})
 
     
@@ -409,6 +467,23 @@ class LarkCardService:
         resp = await self.lark_api.im.v1.message.apatch(req)
         if not resp.success():
             logger.warning(f"[LarkCard] patch_card 失败: code={resp.code} msg={resp.msg}")
+            return False
+        return True
+
+    async def patch_inline_card(self, message_id: str, card_json: dict) -> bool:
+        """Patch an existing message in-place with a raw (non-template) card JSON."""
+        from lark_oapi.api.im.v1 import PatchMessageRequest, PatchMessageRequestBody
+
+        content = json.dumps({"type": "raw", "data": card_json}, ensure_ascii=False)
+        req = (
+            PatchMessageRequest.builder()
+            .message_id(message_id)
+            .request_body(PatchMessageRequestBody.builder().content(content).build())
+            .build()
+        )
+        resp = await self.lark_api.im.v1.message.apatch(req)
+        if not resp.success():
+            logger.warning(f"[LarkCard] patch_inline_card 失败: code={resp.code} msg={resp.msg}")
             return False
         return True
 
@@ -594,6 +669,41 @@ class LarkCardService:
         if message_id:
             return await self.patch_card(message_id, WRSBOT_CARD_USER_VIEW_ID, variables)
         return await self.send_template_card("open_id", open_id, WRSBOT_CARD_USER_VIEW_ID, variables)
+
+    async def send_generated_success_card(self, message_id: str) -> None:
+        """Patch the 'generating' card in-place with the 'generated successfully' notice."""
+        await self.patch_inline_card(message_id, _GENERATED_SUCCESS_CARD)
+
+    async def send_report_content_card(
+        self,
+        open_id: str,
+        report_text: str,
+        dept_name: str = "",
+        iso_week: str = "",
+    ) -> None:
+        """Send the report markdown as a Lark card so headers/bullets render properly."""
+        from astrbot.core.platform.sources.lark.lark_event import LarkMessageEvent
+
+        card = _build_report_content_card(report_text, dept_name, iso_week)
+        await LarkMessageEvent._send_im_message(
+            self.lark_api,
+            content=json.dumps(card, ensure_ascii=False),
+            msg_type="interactive",
+            receive_id=open_id,
+            receive_id_type="open_id",
+        )
+
+    async def send_summary_action_card(self, open_id: str) -> None:
+        """Send the post-generation action card with rewrite input and two buttons."""
+        from astrbot.core.platform.sources.lark.lark_event import LarkMessageEvent
+
+        await LarkMessageEvent._send_im_message(
+            self.lark_api,
+            content=json.dumps(_SUMMARY_ACTION_CARD, ensure_ascii=False),
+            msg_type="interactive",
+            receive_id=open_id,
+            receive_id_type="open_id",
+        )
 
     # ── Binding status helpers (sync — reads from cached org tree) ──────────────
 
@@ -850,6 +960,132 @@ def _build_multi_dept_binding_card(managed_depts: list[dict]) -> dict:
             ],
         },
     }
+
+
+# ── Report generation state cards ───────────────────────────────────────────
+# These two cards share the same message — _GENERATING_CARD is returned
+# synchronously when the button is clicked; _GENERATED_SUCCESS_CARD patches
+# it in-place via patch_inline_card() when the LLM pipeline finishes.
+
+_GENERATING_CARD = {
+    "schema": "2.0",
+    "header": {
+        "title": {"tag": "plain_text", "content": "正在生成周报总结..."},
+        "template": "blue",
+    },
+    "body": {
+        "elements": [
+            {
+                "tag": "markdown",
+                "content": "AI 正在读取周报数据并汇总，请稍候。\n生成完成后将通过私信发送结果，并提供后续操作选项。",
+            }
+        ]
+    },
+}
+
+_GENERATED_SUCCESS_CARD = {
+    "schema": "2.0",
+    "config": {
+        "wide_screen_mode": True
+    },
+    "header": {
+        "title": {
+            "tag": "plain_text",
+            "content": "周报总结已生成"
+        },
+        "template": "green",
+    },
+    "body": {
+        "elements": [
+            {
+                "tag": "div",
+                "text": {
+                    "tag": "lark_md",
+                    "content": "部门周报总结已生成完成，结果已通过私信发送。  \n可在私信中选择重新改写或写入文档。"
+                }
+            }
+        ]
+    },
+}
+
+
+# ── Report content card ─────────────────────────────────────────────────────
+# Wraps the LLM-generated report in a Lark card so the ## / - / ** markdown
+# actually renders. Sent as a new DM between the success notice and the
+# action card.
+
+def _build_report_content_card(report_text: str, dept_name: str = "", iso_week: str = "") -> dict:
+    header_title = " · ".join(p for p in (dept_name, iso_week, "周报总结") if p)
+    return {
+        "schema": "2.0",
+        "header": {
+            "title": {"tag": "plain_text", "content": header_title},
+            "template": "blue",
+        },
+        "body": {
+            "elements": [
+                {"tag": "markdown", "content": report_text},
+            ]
+        },
+    }
+
+
+# ── Post-generation action card ──────────────────────────────────────────────
+# Sent as a plain DM immediately after the summary text message.
+# Contains a style input field + two action buttons.
+
+_SUMMARY_ACTION_CARD = {
+    "schema": "2.0",
+    "header": {
+        "title": {"tag": "plain_text", "content": "周报总结已生成"},
+        "template": "green",
+    },
+    "body": {
+        "elements": [
+            {
+                "tag": "markdown",
+                "content": "请选择下一步操作。如需按特定风格改写，在下方输入要求后点击「重新改写」。",
+            },
+            {"tag": "hr"},
+            {
+                "tag": "input",
+                "name": "style_input",
+                "placeholder": {"tag": "plain_text", "content": "改写风格要求（可选）：如「更简洁」、「突出结果」、「偏向老板汇报风格」"},
+            },
+            {"tag": "hr"},
+            {
+                "tag": "column_set",
+                "flex_mode": "none",
+                "columns": [
+                    {
+                        "tag": "column",
+                        "width": "weighted",
+                        "weight": 1,
+                        "elements": [{
+                            "tag": "button",
+                            "text": {"tag": "plain_text", "content": "重新改写"},
+                            "type": "default",
+                            "width": "fill",
+                            "behaviors": [{"type": "callback", "value": {"action": "rewrite_summary"}}],
+                        }],
+                    },
+                    {
+                        "tag": "column",
+                        "width": "weighted",
+                        "weight": 1,
+                        "elements": [{
+                            "tag": "button",
+                            "text": {"tag": "plain_text", "content": "写入文档 →"},
+                            "type": "primary",
+                            "width": "fill",
+                            "behaviors": [{"type": "callback", "value": {"action": "submit_summary"}}],
+                        }],
+                    },
+                ],
+            },
+        ]
+    },
+}
 
 
 # ── Command list strings ─────────────────────────────────────────────────────

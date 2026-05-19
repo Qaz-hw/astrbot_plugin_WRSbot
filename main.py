@@ -15,6 +15,7 @@
 #    - Report generation workflows (services/report.py)
 #==============================================================
 
+import json
 import re
 from pathlib import Path
 from dotenv import load_dotenv
@@ -64,6 +65,11 @@ class MyPlugin(Star):
         self.card_service.contact_service = self.contact_service
         self.card_service.set_admin_pipeline(self._admin_view_pipeline)
         self.card_service.set_user_pipeline(self._user_view_pipeline)
+        self.card_service.set_report_pipelines(
+            generate=self._generate_pipeline,
+            rewrite=self._rewrite_pipeline,
+            submit=self._submit_pipeline,
+        )
 
 #==============================================================
 #                         Card Commands
@@ -98,8 +104,6 @@ class MyPlugin(Star):
         event._has_send_oper = True
 
 
-    # todo: trigger command need to be rewrote, maybe involking LLM to estimate user's meaning.
-    #       According to UX consideration, duo trigger might needed
     @filter.command("Hello")
     async def cmd_send_wrs_welcome(self, event: AstrMessageEvent):
         """Send Welcome lark card to users"""
@@ -481,7 +485,7 @@ class MyPlugin(Star):
         await sp.put_async(scope="global", scope_id="wrsbot", key="doc_folder_token", value=token)
         yield event.plain_result(f"✅ 文件夹 token 已保存：{token}\n今后直接运行 /test_feishu_doc 即可。")
 
-    async def _user_view_pipeline(self, open_id: str) -> None:
+    async def _user_view_pipeline(self, open_id: str, message_id: str = "") -> None:
         """Async pipeline for the user view card.
 
         Finds this week's file → runs submission check → checks if this
@@ -566,12 +570,201 @@ class MyPlugin(Star):
             )
             is_submitted = user_name in result["submitted"]
 
-            await self.card_service.send_user_view_card(open_id, dept_name, is_submitted)
+            await self.card_service.send_user_view_card(open_id, dept_name, is_submitted, message_id)
 
         except Exception as e:
             logger.error(f"[UserView] 用户视图加载失败: {e}")
 
-    async def _admin_view_pipeline(self, open_id: str) -> None:
+    async def _generate_pipeline(self, open_id: str, message_id: str = "") -> None:
+        """Read this week's reports → LLM summarize → LLM rewrite → send report card + action card."""
+        if not self.lark_api:
+            return
+        from .utils.env_config import get_dept_folder_token
+        from .services.report import summarize_reports, rewrite_summary
+        from datetime import datetime, timedelta
+
+        try:
+            # ── Resolve folder ────────────────────────────────────────────────
+            org_tree = await self.contact_service.get_cached_org_tree()
+            managed = [e for e in org_tree if e.get("manager") and e["manager"].open_id == open_id]
+            if not managed:
+                logger.warning(f"[Generate] 未找到管理的部门: open_id={open_id}")
+                return
+            dept         = managed[0]["dept"]
+            dept_name    = dept.name or ""
+            open_dept_id = getattr(dept, "open_department_id", "") or ""
+            folder_token = get_dept_folder_token(open_dept_id)
+            if not folder_token:
+                logger.warning(f"[Generate] 文件夹未绑定: dept={dept_name}")
+                return
+
+            # ── Find this week's file ─────────────────────────────────────────
+            weekly_file = await self._find_weekly_source(folder_token)
+            if not weekly_file:
+                logger.warning(f"[Generate] 未找到本周文件: folder={folder_token}")
+                return
+
+            if not self.bitable_service:
+                return
+            provider = self.context.get_using_provider(umo=f"lark:open_id:{open_id}")
+            if not provider:
+                return
+
+            # ── Read content ──────────────────────────────────────────────────
+            today  = datetime.now().date()
+            monday = today - timedelta(days=today.weekday())
+            year, week, _ = monday.isocalendar()
+            iso_tag = f"{year}-W{week:02d}"
+
+            if weekly_file["type"] == "bitable":
+                records = await self.bitable_service.list_records(
+                    weekly_file["token"], weekly_file.get("table_id", "")
+                )
+                content = BitableService.records_to_text(records)
+            else:
+                content = await self.doc_service.read_doc_blocks(weekly_file["token"])
+
+            if not content.strip():
+                logger.warning("[Generate] 文件内容为空，无法生成总结")
+                return
+
+            # ── LLM summarize → rewrite ───────────────────────────────────────
+            session_id = f"wrsbot_generate:{open_id}"
+            draft = await summarize_reports(content, dept_name, iso_tag, provider, session_id)
+            final = await rewrite_summary(draft, provider, session_id)
+
+            # ── Persist draft ─────────────────────────────────────────────────
+            await sp.put_async(
+                scope="global", scope_id="wrsbot",
+                key=f"draft:{open_id}",
+                value={"text": final, "weekly_file": weekly_file, "dept_name": dept_name, "iso_week": iso_tag},
+            )
+
+            # ── Deliver ───────────────────────────────────────────────────────
+            if message_id:
+                await self.card_service.send_generated_success_card(message_id)
+            await self.card_service.send_report_content_card(open_id, final, dept_name, iso_tag)
+            await self.card_service.send_summary_action_card(open_id)
+            logger.info(f"[Generate] 周报总结生成完成: dept={dept_name}")
+
+        except Exception as e:
+            logger.error(f"[Generate] 周报总结生成失败: {e}")
+
+    async def _rewrite_pipeline(self, open_id: str, style_input: str) -> None:
+        """Rewrite the stored draft with optional style instructions, then resend."""
+        if not self.lark_api:
+            return
+        from .services.report import rewrite_summary
+
+        try:
+            stored = await sp.get_async(
+                scope="global", scope_id="wrsbot", key=f"draft:{open_id}", default=None
+            )
+            if not stored:
+                logger.warning(f"[Rewrite] 未找到草稿: open_id={open_id}")
+                return
+
+            provider = self.context.get_using_provider(umo=f"lark:open_id:{open_id}")
+            if not provider:
+                return
+
+            final = await rewrite_summary(
+                stored["text"], provider,
+                session_id=f"wrsbot_rewrite:{open_id}",
+                style_input=style_input,
+            )
+
+            await sp.put_async(
+                scope="global", scope_id="wrsbot",
+                key=f"draft:{open_id}",
+                value={**stored, "text": final},
+            )
+
+            await self.card_service.send_report_content_card(
+                open_id, final,
+                stored.get("dept_name", ""), stored.get("iso_week", ""),
+            )
+            await self.card_service.send_summary_action_card(open_id)
+            logger.info(f"[Rewrite] 改写完成: open_id={open_id}")
+
+        except Exception as e:
+            logger.error(f"[Rewrite] 改写失败: {e}")
+
+    async def _submit_pipeline(self, open_id: str) -> None:
+        """Write the stored draft to bitable 部门总结 row."""
+        if not self.lark_api:
+            return
+        from astrbot.api import sp
+        from astrbot.core.platform.sources.lark.lark_event import LarkMessageEvent
+
+        try:
+            stored = await sp.get_async(
+                scope="global", scope_id="wrsbot", key=f"draft:{open_id}", default=None
+            )
+            if not stored:
+                logger.warning(f"[Submit] 未找到草稿: open_id={open_id}")
+                return
+
+            weekly_file = stored.get("weekly_file", {})
+            final_text  = stored.get("text", "")
+            dept_name   = stored.get("dept_name", "")
+
+            if not self.bitable_service:
+                return
+
+            if weekly_file.get("type") == "bitable":
+                app_token = weekly_file["token"]
+                table_id  = weekly_file.get("table_id", "")
+                record_id = await self.bitable_service.find_summary_record(app_token, table_id)
+                if not record_id:
+                    logger.warning("[Submit] 未找到部门总结行，无法写入")
+                    return
+                await self.bitable_service.update_record(
+                    app_token, table_id, record_id, {"本周进展": final_text}
+                )
+            else:
+                logger.warning("[Submit] Doc 写入暂未实现")
+                return
+
+            await LarkMessageEvent._send_im_message(
+                self.lark_api,
+                content=json.dumps(
+                    {"text": f"✅ 周报总结已写入【{dept_name}】本周多维表格「部门总结」行。"},
+                    ensure_ascii=False,
+                ),
+                msg_type="text",
+                receive_id=open_id,
+                receive_id_type="open_id",
+            )
+            logger.info(f"[Submit] 写入完成: dept={dept_name}")
+
+        except Exception as e:
+            logger.error(f"[Submit] 写入失败: {e}")
+
+    async def _find_weekly_source(self, folder_token: str) -> "dict | None":
+        """Shared helper — bitable table-match first, doc name-match second."""
+        from datetime import datetime, timedelta
+        today  = datetime.now().date()
+        monday = today - timedelta(days=today.weekday())
+        year, week, _ = monday.isocalendar()
+        iso_tag = f"{year}-W{week:02d}"
+
+        files = await self.drive_service.list_folder_files(folder_token)
+
+        bitable_files = [f for f in files if f["type"] == "bitable"]
+        if bitable_files and self.bitable_service:
+            tables  = await self.bitable_service.list_tables(bitable_files[0]["token"])
+            matched = next((t for t in tables if iso_tag in t["name"]), None)
+            if matched:
+                return {
+                    **bitable_files[0],
+                    "table_id":   matched["table_id"],
+                    "table_name": matched["name"],
+                }
+
+        return await self.drive_service.find_this_week_file(folder_token)
+
+    async def _admin_view_pipeline(self, open_id: str, message_id: str = "") -> None:
         """Async pipeline triggered by wrsbot_start card action for admin users.
 
         Resolves the manager's dept folder → finds this week's file/table →
@@ -647,7 +840,7 @@ class MyPlugin(Star):
                 logger.warning(f"[AdminView] 提交检查失败: {result['error']}")
                 return
 
-            await self.card_service.send_admin_view_card(open_id, result)
+            await self.card_service.send_admin_view_card(open_id, result, message_id)
 
         except Exception as e:
             logger.error(f"[AdminView] 管理员视图加载失败: {e}")
