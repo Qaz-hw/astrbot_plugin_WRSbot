@@ -104,12 +104,19 @@ class LarkCardService:
         )
 
         # ──Functionalities testing card action callback ─────────────────────────────────────────────────
+
+        # [TEST] Sends a new alarm card as a DM to the clicking user.
+        # open_id: Feishu user ID of the person who clicked the button.
         if action_key == "send_alarm":
             logger.info("✅ 飞书卡片动作已在处理")
             if self.lark_api:
                 asyncio.create_task(self.send_alarm_card("open_id", open_id))
             return P2CardActionTriggerResponse({})
 
+        # [TEST] Marks an alarm as resolved and replaces the card with a resolved summary.
+        # notes_input: text typed by the resolver in the card's notes field.
+        # alarm_time:  original alarm timestamp carried in the button's action_value (set when alarm was created).
+        # complete_time: current UTC+8 time, generated here at resolution.
         if action_key == "complete_alarm":
             logger.info("✅ 飞书卡片动作已在处理")
             form_value: dict = action.form_value or {} if action is not None else {}
@@ -143,6 +150,8 @@ class LarkCardService:
 
         # ── WRSbot welcome card actions ──────────────────────────────────────────
 
+        # Replaces the current card in-place with the main welcome card.
+        # open_id: passed as template variable so the welcome card can personalise the greeting.
         if action_key == "return_to_welcome_page":
             logger.info("[Lark_card] ← 返回主菜单")
             return P2CardActionTriggerResponse({
@@ -155,6 +164,10 @@ class LarkCardService:
                 }
             })
 
+        # Renders the command list card, tailored to the user's role.
+        # is_admin:   checked synchronously against the cached org tree leader set — no await needed.
+        # role_label: display label shown in the card header ("部门负责人" or "团队成员").
+        # cmd_list:   markdown string of available commands; manager gets extra report-generation commands.
         if action_key == "wrsbot_command_list":
             logger.info("[Lark_card] 指令列表")
             is_admin = self.contact_service is not None and self.contact_service.is_manager(open_id)
@@ -172,10 +185,18 @@ class LarkCardService:
                 }
             })
 
+        # Returns an inline JSON card (not a template) with static usage instructions.
+        # Uses "raw" type so the full card body is sent directly — no template variables needed.
         if action_key == "wrsbot_help":
             logger.info("[Lark_card] 帮助")
             return P2CardActionTriggerResponse({"card": {"type": "raw", "data": _HELP_CARD}})
 
+        # Main entry point — routes to admin or employee view based on role.
+        # Managers must have all their departments' folder tokens saved in .env before
+        # the admin dashboard is shown; if any dept is unbound, the binding card is shown instead.
+        # managed:   list of org tree entries where this user is the department leader.
+        # all_bound: True only when every managed dept has a folder token stored in .env.
+        # Employees skip the binding check and go directly to the user view.
         if action_key == "wrsbot_start":
             logger.info("[Lark_card] 开始使用")
             is_admin = self.contact_service is not None and self.contact_service.is_manager(open_id)
@@ -209,6 +230,10 @@ class LarkCardService:
                 }
             })
 
+        # Opens the folder binding tutorial card for the target department.
+        # dept_id: open_department_id carried from the button's action_value — tells the tutorial
+        #          which dept is being bound. Empty for single-dept managers (resolved later in
+        #          send_folder_url by looking up the manager's only managed dept).
         if action_key == "start_binding":
             logger.info("[Lark_card] 开始绑定")
             dept_id = action_value.get("dept_id", "")
@@ -222,6 +247,15 @@ class LarkCardService:
                 }
             })
 
+        # Handles the URL submission from the tutorial card's folder URL input field.
+        # folder_url_input: key of the input element in the card builder — must match exactly.
+        # url:     the raw Feishu folder URL pasted by the user (e.g. https://xxx.feishu.cn/drive/folder/TOKEN).
+        # dept_id: open_department_id carried from the tutorial card's action_value; empty for single-dept
+        #          managers (template card can't carry it), so we fall back to their only managed dept.
+        # token:   the folder token extracted from the URL path segment after /folder/ — this is what
+        #          gets saved to .env and used by the report pipeline to access the Feishu folder.
+        # Failure path: any validation error resets the card to the not-binding state with failed=True
+        #               (shows red header + 绑定失败 status) and surfaces the reason as a toast.
         if action_key == "send_folder_url":
             logger.info("[Lark_card] 提交文件夹链接")
             from ..utils.env_config import extract_folder_token_from_url, set_dept_folder_token
@@ -231,7 +265,7 @@ class LarkCardService:
             dept_id = action_value.get("dept_id", "")
             logger.info(f"[Lark_card][send_folder_url] form_value={form_value} url={repr(url)}")
 
-            # Resolve dept_id for single-dept case (template card doesn't carry it)
+            # Single-dept template card doesn't carry dept_id in action_value — derive from org tree.
             if not dept_id:
                 managed = self._get_managed_depts(open_id)
                 if managed:
@@ -273,6 +307,13 @@ class LarkCardService:
 
             set_dept_folder_token(dept_id, token)
             logger.info(f"[Lark_card] 文件夹绑定成功: dept={dept_id} token={token}")
+            # Resolve dept name from cached org tree for the success card display.
+            dept_name = ""
+            if self.contact_service and self.contact_service._org_tree_cache:
+                for e in self.contact_service._org_tree_cache:
+                    if getattr(e["dept"], "open_department_id", "") == dept_id:
+                        dept_name = e["dept"].name or ""
+                        break
             return P2CardActionTriggerResponse({
                 "toast": {
                     "type": "success",
@@ -283,11 +324,15 @@ class LarkCardService:
                     "type": "template",
                     "data": {
                         "template_id": WRSBOT_BINDING_FEEDBACK_SUCCESS_CARD_ID,
-                        "template_variable": {"open_id": open_id},
+                        "template_variable": {"open_id": open_id, "dept_name": dept_name},
                     },
                 },
             })
 
+        # Kicks off a background org tree refresh without blocking the card response.
+        # create_task() schedules _do_refresh() on the running event loop; the handler returns
+        # immediately with the current (pre-refresh) binding card so the user isn't left waiting.
+        # The toast instructs the user to click Rescan again once the refresh has completed.
         if action_key == "rescan_org_tree":
             logger.info("[Lark_card] 重新扫描通讯录")
             if self.contact_service:
@@ -461,16 +506,18 @@ class LarkCardService:
 
         managed = self._get_managed_depts(open_id)
 
-        # All depts bound and no failure → show success card
+        # All depts bound and no failure → show success card.
+        # dept_name: single dept uses the real name; multiple depts show a collective label.
         if not failed and managed and all(
             bool(get_dept_folder_token(getattr(e["dept"], "open_department_id", "") or ""))
             for e in managed
         ):
+            dept_name = managed[0]["dept"].name or "" if len(managed) == 1 else "所有部门"
             return {
                 "type": "template",
                 "data": {
                     "template_id": WRSBOT_BINDING_FEEDBACK_SUCCESS_CARD_ID,
-                    "template_variable": {"open_id": open_id},
+                    "template_variable": {"open_id": open_id, "dept_name": dept_name},
                 },
             }
 

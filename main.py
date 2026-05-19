@@ -28,6 +28,8 @@ from astrbot.api.platform import MessageType
 
 from .services.lark_card import LarkCardService
 from .services.doc import DocService
+from .services.drive import DriveService
+from .services.bitable import BitableService
 from .services.contact import ContactService
 from .utils.env_config import dump_dept_bindings
 
@@ -40,6 +42,8 @@ class MyPlugin(Star):
         self.lark_api = None
         self.card_service: LarkCardService = None
         self.doc_service: DocService = None
+        self.drive_service: DriveService = None
+        self.bitable_service: BitableService | None = None
         self.contact_service: ContactService = None
 
     async def initialize(self):
@@ -53,6 +57,8 @@ class MyPlugin(Star):
         self.card_service = LarkCardService(self.lark_api)
         self.card_service.inject_into_dispatcher(self.context.platform_manager)
         self.doc_service = DocService(self.lark_api)
+        self.drive_service = DriveService(self.lark_api)
+        self.bitable_service = BitableService(self.lark_api)
         self.contact_service = ContactService(self.lark_api)
         await self.contact_service.start_cache()
         self.card_service.contact_service = self.contact_service
@@ -425,7 +431,6 @@ class MyPlugin(Star):
         yield event.plain_result("开始测试飞书通讯录...")
 
     CARD_KEYWORDS = ["周报", "帮助"]
-
     @filter.event_message_type(filter.EventMessageType.ALL)
     async def keyword_card_reply(self, event: AstrMessageEvent):
         """检测关键词，回复飞书互动卡片。"""
@@ -475,73 +480,12 @@ class MyPlugin(Star):
 
     @filter.command("test_feishu_doc")
     async def test_feishu_doc(self, event: AstrMessageEvent):
-        """测试飞书文档权限：列举文件（访问）、读取内容。
+        """测试飞书文档权限：列举文件、读取内容、识别本周文件。
         用法：/test_feishu_doc [folder_token | folder_url]"""
-
         if not self.lark_api:
             yield event.plain_result("未找到飞书适配器，请确认当前平台为飞书。")
             return
-
-        from .utils.env_config import extract_folder_token_from_url, set_dept_folder_token
-
-        inline_arg = event.message_str.removeprefix("test_feishu_doc").strip().split("?")[0].strip()
-
-        # Accept full Feishu folder URL or raw token
-        if inline_arg.startswith("http"):
-            folder_token = extract_folder_token_from_url(inline_arg) or ""
-        else:
-            folder_token = inline_arg or await sp.get_async(scope="global", scope_id="wrsbot", key="doc_folder_token", default="") or ""
-
-        scope_label = f"指定文件夹 (token: {folder_token})" if folder_token else "机器人云空间根目录"
-        lines = ["══ 飞书文档访问测试 ══", f"  目标: {scope_label}", ""]
-
-        # If a URL was given and token extracted, save to .env against the sender's dept
-        if inline_arg.startswith("http") and folder_token:
-            try:
-                org_tree = await self.contact_service.get_cached_org_tree()
-                sender_id = event.get_sender_id()
-                managed = [
-                    e for e in org_tree
-                    if e.get("manager") and e["manager"].open_id == sender_id
-                ]
-                if managed:
-                    open_dept_id = getattr(managed[0]["dept"], "open_department_id", "") or ""
-                    dept_name = managed[0]["dept"].name or open_dept_id
-                    if open_dept_id:
-                        set_dept_folder_token(open_dept_id, folder_token)
-                        lines.append(f"✅ token 已保存至 .env（部门：{dept_name}）")
-                else:
-                    lines.append("⚠️ 未找到你管理的部门，token 未保存至 .env")
-            except Exception as e:
-                lines.append(f"⚠️ 保存 token 失败: {e}")
-            lines.append("")
-
-        lines.append("【1】访问测试 — 列举目标文件夹内容")
-        doc_token = None
-        try:
-            files = await self.doc_service.list_folder_files(folder_token)
-            lines.append(f"  ✅ 成功，共 {len(files)} 个条目")
-            for f in files:
-                lines.append(f"  - [{f.type}] {f.name}  (token: {f.token})")
-                if f.type == "docx" and doc_token is None:
-                    doc_token = f.token
-        except Exception as e:
-            lines.append(f"  ❌ 失败: {e}")
-
-        lines.append("")
-        lines.append("【2】读取测试 — 读取文档原始内容")
-        if doc_token:
-            try:
-                content = await self.doc_service.read_doc_plaintext(doc_token)
-                content = content.replace("\n", " ")
-                preview = content[:120] + ("..." if len(content) > 120 else "")
-                lines.append(f"  ✅ 成功，内容预览: {preview}")
-            except Exception as e:
-                lines.append(f"  ❌ 失败: {e}")
-        else:
-            lines.append("  ⚠️ 跳过：未找到 docx 文件")
-
-        yield event.plain_result("\n".join(lines))
+        yield event.plain_result(await _DocTestRunner(self).run(event))
 
 #==============================================================
 #                          Lifecycle
@@ -549,3 +493,287 @@ class MyPlugin(Star):
 
     async def terminate(self):
         self.contact_service.stop_cache()
+
+
+# ==============================================================
+#                     Dev Test Runners
+# ==============================================================
+# Heavy implementation logic for developer test commands.
+# Kept here so command handlers above stay thin.
+# Each runner receives the plugin instance and an event.
+# ==============================================================
+
+class _DocTestRunner:
+    """Runs the multi-step /test_feishu_doc diagnostic and returns a formatted result string."""
+
+    def __init__(self, plugin: "MyPlugin"):
+        self.plugin = plugin
+
+    async def run(self, event: AstrMessageEvent) -> str:
+        from .utils.env_config import extract_folder_token_from_url, set_dept_folder_token
+
+        inline_arg = event.message_str.removeprefix("test_feishu_doc").strip().split("?")[0].strip()
+
+        if inline_arg.startswith("http"):
+            folder_token = extract_folder_token_from_url(inline_arg) or ""
+            source_label = f"URL 参数 (token: {folder_token})"
+        elif inline_arg:
+            folder_token = inline_arg
+            source_label = f"手动参数 (token: {folder_token})"
+        else:
+            # No arg — auto-detect from org tree membership + .env binding
+            folder_token, source_label = await self._resolve_folder_token(event)
+
+        lines = ["══ 飞书文档访问测试 ══", f"  目标: {source_label}", ""]
+
+        if not folder_token:
+            logger.warning(f"[DocTest] 未能确定文件夹 token: {source_label}  sender={event.get_sender_id()}")
+            lines.append("❌ 无法继续：未找到文件夹 token。")
+            lines.append("   请通过以下任一方式提供：")
+            lines.append("   • /test_feishu_doc <folder_url>  — 直接传入文件夹链接")
+            lines.append("   • 在绑定流程中完成部门文件夹绑定，再重试无参数命令")
+            return "\n".join(lines)
+
+        # Save token to .env when a URL is provided, matched against the sender's managed dept.
+        if inline_arg.startswith("http") and folder_token:
+            lines += await self._save_token(event, folder_token, set_dept_folder_token)
+            lines.append("")
+
+        lines += await self._step_list_files(folder_token)
+        lines += await self._step_read_doc(self._last_doc_token)
+        lines += await self._step_find_weekly(event, folder_token)
+        lines += await self._step_submission_check(event)
+
+        return "\n".join(lines)
+
+    async def _resolve_folder_token(self, event: AstrMessageEvent) -> tuple[str, str]:
+        """Auto-detect the folder token for the sender based on org tree membership and .env.
+
+        Searches the cached org tree for which department the sender belongs to,
+        then looks up the bound folder token from .env for that dept.
+
+        Returns (folder_token, source_label). folder_token is "" when nothing is found.
+        """
+        from .utils.env_config import get_dept_folder_token
+
+        sender_id = event.get_sender_id()
+        try:
+            org_tree = await self.plugin.contact_service.get_cached_org_tree()
+        except Exception as e:
+            logger.warning(f"[DocTest] 通讯录缓存未就绪，无法自动匹配文件夹: {e}")
+            return "", "未知（通讯录缓存未就绪）"
+
+        for entry in org_tree:
+            in_dept = any(
+                getattr(m, "open_id", None) == sender_id
+                for m in entry.get("members", [])
+            )
+            if not in_dept:
+                continue
+
+            dept = entry["dept"]
+            open_dept_id = getattr(dept, "open_department_id", "") or ""
+            dept_name = dept.name or open_dept_id
+            token = get_dept_folder_token(open_dept_id)
+
+            if token:
+                logger.info(f"[DocTest] 自动匹配文件夹: dept={dept_name} token={token}")
+                return token, f"{dept_name} 部门（.env 自动匹配，token: {token}）"
+
+            # Dept found but no token bound
+            logger.warning(f"[DocTest] 找到部门但未绑定文件夹: dept={dept_name} open_dept_id={open_dept_id}")
+            return "", f"{dept_name} 部门（未绑定文件夹，请先完成绑定流程）"
+
+        logger.warning(f"[DocTest] 发送者不在任何部门: sender_id={sender_id}")
+        return "", f"未在通讯录中找到你所属的部门（open_id: {sender_id}）"
+
+    # ── Internal state ───────────────────────────────────────────────────────
+
+    _last_doc_token: str | None = None    # set by _step_list_files, used by _step_read_doc
+    _last_weekly_file: dict | None = None  # set by _step_find_weekly, used by _step_submission_check
+
+    # ── Steps ────────────────────────────────────────────────────────────────
+
+    async def _save_token(self, event, folder_token: str, set_fn) -> list[str]:
+        lines = []
+        try:
+            org_tree = await self.plugin.contact_service.get_cached_org_tree()
+            sender_id = event.get_sender_id()
+            managed = [e for e in org_tree if e.get("manager") and e["manager"].open_id == sender_id]
+            if managed:
+                open_dept_id = getattr(managed[0]["dept"], "open_department_id", "") or ""
+                dept_name = managed[0]["dept"].name or open_dept_id
+                if open_dept_id:
+                    set_fn(open_dept_id, folder_token)
+                    lines.append(f"✅ token 已保存至 .env（部门：{dept_name}）")
+            else:
+                lines.append("⚠️ 未找到你管理的部门，token 未保存至 .env")
+        except Exception as e:
+            lines.append(f"⚠️ 保存 token 失败: {e}")
+        return lines
+
+    async def _step_list_files(self, folder_token: str) -> list[str]:
+        lines = ["【1】访问测试 — 列举目标文件夹内容"]
+        self._last_doc_token = None
+        try:
+            files = await self.plugin.doc_service.list_folder_files(folder_token)
+            lines.append(f"  ✅ 成功，共 {len(files)} 个条目")
+            for f in files:
+                lines.append(f"  - [{f.type}] {f.name}  (token: {f.token})")
+                if f.type == "docx" and self._last_doc_token is None:
+                    self._last_doc_token = f.token
+        except Exception as e:
+            lines.append(f"  ❌ 失败: {e}")
+        return lines
+
+    async def _step_read_doc(self, doc_token: str | None) -> list[str]:
+        lines = ["", "【2】读取测试 — 读取文档原始内容"]
+        if not doc_token:
+            lines.append("  ⚠️ 跳过：未找到 docx 文件")
+            return lines
+        try:
+            content = await self.plugin.doc_service.read_doc_plaintext(doc_token)
+            preview = content.replace("\n", " ")[:120]
+            if len(content) > 120:
+                preview += "..."
+            lines.append(f"  ✅ 成功，内容预览: {preview}")
+        except Exception as e:
+            lines.append(f"  ❌ 失败: {e}")
+        return lines
+
+    async def _step_find_weekly(self, event: AstrMessageEvent, folder_token: str) -> list[str]:
+        lines = ["", "【3】本周文件识别 — 规则匹配 + LLM 兜底"]
+        self._last_weekly_file = None
+        if not folder_token:
+            lines.append("  ⚠️ 跳过：未提供文件夹 token")
+            return lines
+        try:
+            found = await self.plugin.drive_service.find_this_week_file(
+                folder_token, llm_fn=self._make_llm_fn(event)
+            )
+            if found:
+                self._last_weekly_file = found
+                lines.append(
+                    f"  ✅ 找到本周文件: 「{found['name']}」  type={found['type']}  token={found['token']}"
+                )
+            else:
+                lines.append("  ⚠️ 未识别出本周文件（规则和 LLM 均未匹配）")
+        except Exception as e:
+            lines.append(f"  ❌ 失败: {e}")
+        return lines
+
+    async def _step_submission_check(self, event: AstrMessageEvent) -> list[str]:
+        """Step 4 — read this week's file content, get dept members, ask LLM who submitted."""
+        import json
+        from .prompts.submission_check import build_submission_check_prompt
+
+        lines = ["", "【4】提交情况检查 — 成员 vs 周报内容"]
+
+        if not self._last_weekly_file:
+            lines.append("  ⚠️ 跳过：第3步未找到本周文件")
+            return lines
+
+        file = self._last_weekly_file
+        file_type = file["type"]
+        file_token = file["token"]
+
+        # ── Read file content ────────────────────────────────────────────────
+        content = ""
+        try:
+            if file_type == "bitable":
+                bitable = self.plugin.bitable_service
+                if not bitable:
+                    lines.append("  ❌ BitableService 未初始化")
+                    return lines
+                tables = await bitable.list_tables(file_token)
+                if not tables:
+                    lines.append("  ❌ Bitable 无可用表格")
+                    return lines
+                table_id = tables[0]["table_id"]
+                records = await bitable.list_records(file_token, table_id)
+                content = bitable.records_to_text(records)
+                lines.append(f"  📋 Bitable: 共 {len(records)} 条记录（表格：{tables[0]['name'] or table_id}）")
+            elif file_type in ("docx", "doc"):
+                content = await self.plugin.doc_service.read_doc_plaintext(file_token)
+                lines.append(f"  📄 Doc: 读取成功，{len(content)} 字符")
+            else:
+                lines.append(f"  ⚠️ 跳过：不支持的文件类型 {file_type!r}")
+                return lines
+        except Exception as e:
+            lines.append(f"  ❌ 读取文件内容失败: {e}")
+            return lines
+
+        # ── Get dept members from org tree ───────────────────────────────────
+        sender_id = event.get_sender_id()
+        members: list[dict] = []
+        try:
+            org_tree = await self.plugin.contact_service.get_cached_org_tree()
+            for entry in org_tree:
+                in_dept = any(
+                    getattr(m, "open_id", None) == sender_id
+                    for m in entry.get("members", [])
+                )
+                if in_dept:
+                    members = [
+                        {
+                            "name": m.name or "",
+                            "open_id": m.open_id or "",
+                            "job_title": getattr(m, "job_title", "") or "",
+                        }
+                        for m in entry.get("members", [])
+                    ]
+                    dept_name = entry["dept"].name or ""
+                    lines.append(f"  👥 部门：{dept_name}，共 {len(members)} 名成员")
+                    break
+        except Exception as e:
+            lines.append(f"  ❌ 获取部门成员失败: {e}")
+            return lines
+
+        if not members:
+            lines.append("  ⚠️ 未找到你所属的部门成员，无法检查提交情况")
+            return lines
+
+        # ── Ask LLM ─────────────────────────────────────────────────────────
+        prompt = build_submission_check_prompt(members, content, file_type)
+        provider = self.plugin.context.get_using_provider(umo=event.unified_msg_origin)
+        if not provider:
+            lines.append("  ❌ 无可用 LLM 提供者")
+            return lines
+
+        try:
+            resp = await provider.text_chat(prompt=prompt, session_id=event.unified_msg_origin)
+            raw = resp.completion_text.strip()
+            result = json.loads(raw)
+            submitted     = result.get("submitted", [])
+            not_submitted = result.get("not_submitted", [])
+        except (json.JSONDecodeError, Exception) as e:
+            lines.append(f"  ❌ LLM 解析失败: {e}\n  原始回复: {getattr(resp, 'completion_text', '')[:200]}")
+            return lines
+
+        total = len(members)
+        lines.append(f"  ✅ 已提交 ({len(submitted)}/{total})：{', '.join(submitted) or '（无）'}")
+        lines.append(f"  ❌ 未提交 ({len(not_submitted)}/{total})：{', '.join(not_submitted) or '（无）'}")
+        return lines
+
+    def _make_llm_fn(self, event: AstrMessageEvent):
+        """Return an async callable that asks the LLM to pick the best file name from a list."""
+        plugin = self.plugin
+
+        async def _llm_pick(names: list[str]) -> str | None:
+            from datetime import datetime as _dt
+            today = _dt.now()
+            _, week, _ = today.isocalendar()
+            prompt = (
+                f"今天是 {today.strftime('%Y-%m-%d')}（第 {week} 周）。"
+                f"以下是飞书文件夹中的文件名列表：\n"
+                + "\n".join(f"- {n}" for n in names)
+                + "\n\n哪个文件最可能是本周的周报？请只回复文件名，不要添加其他内容。如果都不像，请回复 none。"
+            )
+            provider = plugin.context.get_using_provider(umo=event.unified_msg_origin)
+            if not provider:
+                return None
+            resp = await provider.text_chat(prompt=prompt, session_id=event.unified_msg_origin)
+            chosen = resp.completion_text.strip().strip('"').strip("'")
+            return chosen if chosen.lower() != "none" else None
+
+        return _llm_pick
