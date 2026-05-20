@@ -153,7 +153,10 @@ def _build_generate_prompt(
     iso_week: str,
     submitted: list[str] | None = None,
     not_submitted: list[str] | None = None,
+    style_profile: dict | None = None,
 ) -> tuple[str, str]:
+    from ..utils.manager_style import render_style_for_prompt
+
     status_section = ""
     if submitted is not None or not_submitted is not None:
         status_section = (
@@ -161,8 +164,20 @@ def _build_generate_prompt(
             f"- 已提交：{'、'.join(submitted) if submitted else '（无）'}\n"
             f"- 未提交：{'、'.join(not_submitted) if not_submitted else '（无）'}\n\n"
         )
+
+    # Per-manager style profile — empty string when not configured. Slotted
+    # into the user prompt (not system) so per-manager content doesn't
+    # fragment the system-prompt cache across users.
+    style_block = render_style_for_prompt(style_profile)
+    style_section = (
+        f"## 个人风格档案（仅影响语气/措辞；不可改变事实、章节、排序与硬性约束）\n"
+        f"{style_block}\n\n"
+        if style_block else ""
+    )
+
     user = (
         f"{status_section}"
+        f"{style_section}"
         f"以下是【{dept_name}】{iso_week} 的全体成员周报原文：\n\n"
         f"---\n{content}\n---\n\n"
         f"请按照四章节格式，直接输出面向管理层的部门周报。"
@@ -199,10 +214,22 @@ def _build_rewrite_prompt(
     draft: str,
     style_input: str = "",
     not_submitted: list[str] | None = None,
+    style_profile: dict | None = None,
 ) -> tuple[str, str]:
+    from ..utils.manager_style import render_style_for_prompt
+
     style_section = ""
     if style_input.strip():
         style_section = f"额外改写要求（优先执行）：{style_input.strip()}\n\n"
+
+    # Per-manager saved profile — applied to rewrites too so the rewrite
+    # button respects the same voice anchors as initial generation.
+    profile_block = render_style_for_prompt(style_profile)
+    profile_section = (
+        f"## 个人风格档案（仅影响语气/措辞；不可删改事实）\n{profile_block}\n\n"
+        if profile_block else ""
+    )
+
     context_section = ""
     if not_submitted:
         context_section = (
@@ -211,6 +238,7 @@ def _build_rewrite_prompt(
         )
     user = (
         f"{style_section}"
+        f"{profile_section}"
         f"{context_section}"
         f"请将以下周报草稿按照上述规则进行改写：\n\n"
         f"---\n{draft}\n---"
@@ -464,6 +492,7 @@ async def generate_report_stream(
     session_id: str,
     submitted: list[str] | None = None,
     not_submitted: list[str] | None = None,
+    style_profile: dict | None = None,
 ) -> AsyncGenerator[str, None]:
     """Single-pass report generation — fact extraction + executive style in one LLM call.
 
@@ -477,6 +506,7 @@ async def generate_report_stream(
     sys_p, usr_p = _build_generate_prompt(
         content, dept_name, iso_week,
         submitted=submitted, not_submitted=not_submitted,
+        style_profile=style_profile,
     )
     stream = llm_provider.text_chat_stream(
         prompt=usr_p, system_prompt=sys_p, session_id=session_id,
@@ -491,13 +521,18 @@ async def rewrite_summary_stream(
     session_id: str,
     style_input: str = "",
     not_submitted: list[str] | None = None,
+    style_profile: dict | None = None,
 ) -> AsyncGenerator[str, None]:
     """Streaming variant of rewrite_summary — yields cumulative text snapshots.
 
     not_submitted: passed through so the rewrite prompt knows to preserve the
     「说明」 section if the draft contains one.
     """
-    sys_p, usr_p = _build_rewrite_prompt(draft, style_input, not_submitted=not_submitted)
+    sys_p, usr_p = _build_rewrite_prompt(
+        draft, style_input,
+        not_submitted=not_submitted,
+        style_profile=style_profile,
+    )
     stream = llm_provider.text_chat_stream(
         prompt=usr_p, system_prompt=sys_p, session_id=session_id,
     )

@@ -5,11 +5,18 @@
 #  Responsibilities:
 #    - Read / write per-department Feishu folder tokens to .env
 #    - Extract folder token from a Feishu folder URL
+#    - Build the user-facing folder URL from token + tenant prefix
 #    - Dump all bindings cross-referenced against org tree (dev check)
 #
 #  Key format in .env:
 #    DEPT_FOLDER_{open_department_id with hyphens → underscores}
 #    e.g.  DEPT_FOLDER_od_c5a40c187b6a50163de9c30b4dbe84b4=fldcnXXX
+#
+#  Tenant URL prefix:
+#    Tenant subdomains differ per Feishu tenant but stay constant per
+#    deployment, so we keep a single prefix and just append the token.
+#    Override via FEISHU_DRIVE_FOLDER_URL_PREFIX in .env if your tenant
+#    isn't the default below.
 #
 #  Does NOT contain:
 #    - Card logic
@@ -25,6 +32,13 @@ from dotenv import set_key, unset_key, dotenv_values
 
 _ENV_PATH = Path(__file__).parent.parent / ".env"
 _DEPT_FOLDER_PREFIX = "DEPT_FOLDER_"
+
+# Tenant-specific folder URL prefix. Trailing slash required. Override via
+# .env to support a different Feishu tenant subdomain or larksuite.com.
+FEISHU_DRIVE_FOLDER_URL_PREFIX = os.getenv(
+    "FEISHU_DRIVE_FOLDER_URL_PREFIX",
+    "https://ucnfx592kr5a.feishu.cn/drive/folder/",
+)
 
 
 # ── Key helpers ──────────────────────────────────────────────────────────────
@@ -54,6 +68,20 @@ def set_dept_folder_token(open_dept_id: str, token: str) -> None:
     key = _to_env_key(open_dept_id)
     set_key(_ENV_PATH, key, token)
     os.environ[key] = token
+
+
+def get_dept_folder_url(open_dept_id: str) -> str | None:
+    """Return the user-facing folder URL for a department.
+
+    Built from FEISHU_DRIVE_FOLDER_URL_PREFIX + stored token. Returns None
+    only when no token is bound. URLs reconstruct deterministically — the
+    tenant subdomain is constant per deployment — so we don't store the
+    URL itself, just the token.
+    """
+    token = get_dept_folder_token(open_dept_id)
+    if not token:
+        return None
+    return FEISHU_DRIVE_FOLDER_URL_PREFIX + token
 
 
 def delete_dept_folder_token(open_dept_id: str) -> bool:

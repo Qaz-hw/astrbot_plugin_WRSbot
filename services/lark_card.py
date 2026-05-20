@@ -55,6 +55,8 @@ WRSBOT_ADMIN_VIEW_CARD_ID = os.getenv("WRSBOT_ADMIN_VIEW_CARD_ID", "AAqtVhgEFc7g
 WRSBOT_ADMIN_REPORT_SUMMARY_CHECK_CARD_ID = os.getenv("WRSBOT_ADMIN_REPORT_SUMMARY_CHECK_CARD_ID", "AAqtVXND6ex3t") #Report Submission check. triggered when starting weekly report summary when not everyone in the department is submitted their report 
 WRSBOT_CARD_USER_VIEW_ID = os.getenv("WRSBOT_CARD_USER_VIEW_ID", "AAqtDwcOM8ogx")
 WRSBOT_SUMMARY_REWRITE_CARD_ID = os.getenv("WRSBOT_SUMMARY_REWRITE_CARD_ID", "AAqtF6JbQ9ZBu")
+WRSBOT_STYLE_CONFIG_CARD_ID = os.getenv("WRSBOT_STYLE_CONFIG_CARD_ID", "AAqtBTDTqvzR4")
+
 
 
 
@@ -68,6 +70,9 @@ class LarkCardService:
         self._rewrite_pipeline_fn  = None
         self._submit_pipeline_fn   = None
         self._reminder_pipeline_fn = None
+        self._open_style_config_fn = None
+        self._save_style_fn        = None
+        self._view_doc_fn          = None
 
     def set_user_pipeline(self, fn) -> None:
         """Signature: async fn(open_id: str) -> None"""
@@ -91,6 +96,26 @@ class LarkCardService:
     def set_reminder_pipeline(self, fn) -> None:
         """Signature: async fn(manager_open_id: str) -> None"""
         self._reminder_pipeline_fn = fn
+
+    def set_style_pipelines(self, *, open_config, save) -> None:
+        """Register manager-style pipelines.
+
+        open_config: async fn(open_id: str) -> None
+                     Sends the style config card pre-filled with saved values.
+        save:        async fn(open_id, tone_tags, custom_instructions,
+                              writing_samples) -> None
+                     Persists form_value to sp.
+        """
+        self._open_style_config_fn = open_config
+        self._save_style_fn        = save
+
+    def set_view_doc_pipeline(self, fn) -> None:
+        """Signature: async fn(open_id: str) -> None
+
+        Resolves the caller's dept folder URL and sends it as a text DM.
+        Triggered by the view_doc card action.
+        """
+        self._view_doc_fn = fn
 
     # ── Dispatcher injection ─────────────────────────────────────────────────
 
@@ -449,6 +474,108 @@ class LarkCardService:
                 }
             })
 
+
+        # Patches the CURRENT card (admin view) in-place into the style config
+        # card, pre-filled with this manager's saved profile. Sync sp read
+        # via get_manager_style_sync — no async hop, no DM, no "loading"
+        # flicker. The card flips immediately when the user clicks.
+        if action_key == "open_style_config":
+            logger.info("[Lark_card] 打开个人风格配置（in-place patch）")
+            if not WRSBOT_STYLE_CONFIG_CARD_ID:
+                logger.warning("[Lark_card] WRSBOT_STYLE_CONFIG_CARD_ID 未配置")
+                return P2CardActionTriggerResponse({
+                    "toast": {
+                        "type": "error",
+                        "content": "风格配置卡片未配置，请联系管理员",
+                        "i18n": {
+                            "zh_cn": "风格配置卡片未配置，请联系管理员",
+                            "en_us": "Style config card not configured.",
+                        },
+                    }
+                })
+            from ..utils.manager_style import get_manager_style_sync
+            profile = get_manager_style_sync(open_id)
+            return P2CardActionTriggerResponse({
+                "card": {
+                    "type": "template",
+                    "data": {
+                        "template_id": WRSBOT_STYLE_CONFIG_CARD_ID,
+                        "template_variable": {
+                            "open_id":               open_id,
+                            "tone_tags_preselected": profile["tone_tags"],
+                            "custom_instructions":   profile["custom_instructions"],
+                            "writing_samples":       profile["writing_samples"],
+                            "updated_at":            profile["updated_at"] or "（尚未保存）",
+                        },
+                    },
+                }
+            })
+
+        # Sends the caller's department folder URL as a text DM. Resolves
+        # dept via the cached org tree; falls back to a guidance message if
+        # the folder isn't bound or the binding predates URL storage.
+        # Card stays unchanged (toast-only); URL arrives as a separate DM
+        # so it's clickable in Feishu.
+        if action_key == "view_doc":
+            logger.info("[Lark_card] 查看本周文档")
+            if self._view_doc_fn:
+                asyncio.create_task(self._view_doc_fn(open_id))
+            return P2CardActionTriggerResponse({
+                "toast": {
+                    "type": "info",
+                    "content": "已发送本周文档链接，请查收私聊",
+                    "i18n": {
+                        "zh_cn": "已发送本周文档链接，请查收私聊",
+                        "en_us": "Folder link sent — check your DM.",
+                    },
+                }
+            })
+
+        if action_key == "cancel_update_style":
+            logger.info("[Lark_card] 取消风格配置 → 回到管理视图")
+            if self._admin_pipeline_fn:
+                asyncio.create_task(
+                    self._admin_pipeline_fn(open_id, message_id)
+                )
+            return P2CardActionTriggerResponse({
+                "toast": {
+                    "type": "info",
+                    "content": "已取消",
+                    "i18n": {"zh_cn": "已取消", "en_us": "Cancelled."},
+                }
+            })
+
+
+        if action_key == "save_manager_style":
+            logger.info("[Lark_card] 保存个人风格")
+            form_value: dict = action.form_value or {} if action is not None else {}
+
+            raw_tags = form_value.get("tone_tags_input", [])
+            if not isinstance(raw_tags, list):
+                raw_tags = [raw_tags] if raw_tags else []
+            tone_tags = [str(t) for t in raw_tags if t]
+            custom  = str(form_value.get("custom_instructions_input", "") or "")
+            samples = str(form_value.get("writing_samples_input", "") or "")
+
+            if self._save_style_fn:
+                asyncio.create_task(
+                    self._save_style_fn(open_id, tone_tags, custom, samples)
+                )
+            # After save, patch back to the admin view so the manager returns
+            # to the parent surface. Pipeline runs async — card stays on the
+            # config card with "已保存" toast for ~1-2s, then patches in place.
+            if self._admin_pipeline_fn:
+                asyncio.create_task(
+                    self._admin_pipeline_fn(open_id, message_id)
+                )
+            return P2CardActionTriggerResponse({
+                "toast": {
+                    "type": "success",
+                    "content": "风格已保存",
+                    "i18n": {"zh_cn": "风格已保存", "en_us": "Style saved."},
+                }
+            })
+
         # style_input: free-form style instructions from the manager's text input.
         # Reruns only the rewrite pass against the draft stored in sp.
         if action_key == "rewrite_summary":
@@ -743,6 +870,41 @@ class LarkCardService:
         if message_id:
             return await self.patch_card(message_id, WRSBOT_CARD_USER_VIEW_ID, variables)
         return await self.send_template_card("open_id", open_id, WRSBOT_CARD_USER_VIEW_ID, variables)
+
+    async def send_style_config_card(
+        self,
+        open_id: str,
+        *,
+        tone_tags: list[str],
+        custom_instructions: str,
+        writing_samples: str,
+        updated_at: str,
+    ) -> bool:
+        """Send the manager-style config card pre-filled with saved values.
+
+        Template variables — must match the placeholders in the Feishu builder
+        template WRSBOT_STYLE_CONFIG_CARD_ID:
+          open_id                 — for personalized header
+          tone_tags_preselected   — list of currently-selected tag keys, fed
+                                    into the multi-select's default_values
+          custom_instructions     — pre-filled textarea content
+          writing_samples         — pre-filled textarea content
+          updated_at              — display string, "（尚未保存）" if empty
+        """
+
+        if not WRSBOT_STYLE_CONFIG_CARD_ID:
+            logger.warning("[Lark_card] WRSBOT_STYLE_CONFIG_CARD_ID 未配置，无法发送风格配置卡片")
+            return False
+        variables = {
+            "open_id":               open_id,
+            "tone_tags_preselected": tone_tags,
+            "custom_instructions":   custom_instructions or "",
+            "writing_samples":       writing_samples or "",
+            "updated_at":            updated_at or "（尚未保存）",
+        }
+        return await self.send_template_card(
+            "open_id", open_id, WRSBOT_STYLE_CONFIG_CARD_ID, variables,
+        )
 
     async def send_generated_success_card(self, message_id: str) -> None:
         """Patch the 'generating' card in-place with the 'generated successfully' notice."""

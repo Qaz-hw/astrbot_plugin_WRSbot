@@ -34,10 +34,8 @@ from .services.bitable import BitableService
 from .services.contact import ContactService
 from .utils.env_config import dump_dept_bindings
 
-# todo：add 支持配置“个人风格特征词”，让输出结果尽可能模仿管理者的撰写口吻。function
-# todo: update commands for user & manager's better workflow e.g. start with user_view/manager_view card
-# todo: completely formulate, strucutre the code, delete redundent files/ unused functions and add more comments
-# todo: action view_doc send user straight to department weekly report folder
+# TODO：added 支持配置“个人风格特征词”，让输出结果尽可能模仿管理者的撰写口吻。function.py
+# TODO: completely formulate, strucutre the code, delete redundent files/ unused functions and add more comments
 
 @register("helloworld", "YourName", "一个简单的 Hello World 插件", "1.0.0")
 class MyPlugin(Star):
@@ -75,6 +73,11 @@ class MyPlugin(Star):
             submit=self._submit_pipeline,
         )
         self.card_service.set_reminder_pipeline(self._reminder_pipeline)
+        self.card_service.set_style_pipelines(
+            open_config=self._open_style_config_pipeline,
+            save=self._save_manager_style_pipeline,
+        )
+        self.card_service.set_view_doc_pipeline(self._view_doc_pipeline)
 
 #==============================================================
 #                         Card Commands
@@ -471,6 +474,173 @@ class MyPlugin(Star):
         event.stop_event()
         yield event.plain_result("开始测试飞书通讯录...")
 
+    # Confidence threshold for LLM-classified intent. The classifier returns
+    # 0.0–1.0; only act when the model is genuinely sure. 0.9 favors missing
+    # ambiguous requests over false-triggering on unrelated chat.
+    _INTENT_THRESHOLD = 0.9
+
+    # Cheap pre-filter — only invoke the LLM classifier when the message
+    # plausibly relates to weekly reports. Skips LLM cost on every "hi" /
+    # "ok" / unrelated chat. Keep lenient; LLM is the real decision-maker.
+    _INTENT_HINTS = (
+        "周报", "汇总", "总结", "写", "提交", "report", "summary", "submit",
+    )
+
+    _INTENT_SYSTEM = (
+        "你是一名意图识别助手。判断用户的一句话属于以下哪种「与本周周报相关」的意图：\n"
+        "  • generate_summary: 请求生成 / 汇总 / 输出本部门的周报总结\n"
+        "      例：帮我生成周报汇总 / 给我周报总结 / 部门周报来一份 / 出本周周报\n"
+        "  • get_writing_folder: 自己想要写 / 提交 / 上传本周周报，需要文件夹链接\n"
+        "      例：我要写周报 / 周报往哪交 / 给我周报文件夹 / 这周周报怎么写\n"
+        "  • none: 其他所有情况（讨论内容、抱怨、问别人提交了没、无关闲聊、查看历史周报）\n\n"
+        "仅以下列 JSON 格式回复，禁止任何额外文字或代码块：\n"
+        '{"intent": "<generate_summary|get_writing_folder|none>", '
+        '"confidence": <0-1 小数>, "reason": "<不超过20字>"}'
+    )
+
+    @filter.event_message_type(filter.EventMessageType.ALL)
+    async def natural_report_trigger(self, event: AstrMessageEvent):
+        """LLM-gated natural-language entry — routes by detected intent + role.
+
+        Intents (from _INTENT_SYSTEM classifier):
+          • generate_summary    → managers only: fire admin view pipeline
+          • get_writing_folder  → anyone: reply with bound folder URL
+          • none / low conf     → silent skip
+
+        Group behavior:
+          • generate_summary: ack in-group, DM the admin view card
+          • get_writing_folder: reply inline (URL is not sensitive)
+
+        Failure modes:
+          • LLM/parse error → fail closed, no trigger (welcome card + slash
+            commands remain as deterministic fallbacks)
+          • generate_summary by non-manager → silent skip (unauthorized)
+          • get_writing_folder but no folder bound → reply with binding guidance
+
+        Registered BEFORE keyword_card_reply so the broader "周报" keyword
+        doesn't intercept specific intents first.
+        """
+        from astrbot.core.platform.sources.lark.lark_event import LarkMessageEvent
+        if not isinstance(event, LarkMessageEvent):
+            return
+
+        raw = event.message_str or ""
+        if raw.lstrip().startswith("/"):
+            return  # slash commands → group_command_dispatcher
+
+        # Strip @-mentions so "@wrsbot 我要写周报" classifies on the body.
+        text = re.sub(r"\[At:[^\]]*\]", "", raw)
+        text = re.sub(r"@\S+", "", text).strip()
+        if not text:
+            return  # bare @-mention with no content — nothing to classify
+
+        # Cheap pre-filter to skip LLM call on unrelated chat.
+        if not any(h in text.lower() for h in self._INTENT_HINTS):
+            return
+
+        open_id = event.get_sender_id()
+        provider = self.context.get_using_provider(
+            umo=f"lark:open_id:{open_id}"
+        )
+        if not provider:
+            logger.warning(f"[NaturalTrigger] 未找到 LLM provider: open_id={open_id}")
+            return
+
+        # ── LLM intent classification ─────────────────────────────────────
+        try:
+            resp = await provider.text_chat(
+                prompt=text,
+                system_prompt=self._INTENT_SYSTEM,
+                session_id=f"wrsbot_intent:{open_id}",
+            )
+            raw_out = (resp.completion_text or "").strip()
+            if raw_out.startswith("```"):
+                raw_out = raw_out.split("```")[1].lstrip("json").strip()
+            parsed     = json.loads(raw_out)
+            intent     = str(parsed.get("intent", "none"))
+            confidence = float(parsed.get("confidence", 0.0))
+            reason     = str(parsed.get("reason", ""))
+        except Exception as e:
+            logger.warning(f"[NaturalTrigger] LLM 意图判定失败: {e}")
+            return
+
+        logger.info(
+            f"[NaturalTrigger] open_id={open_id} text={text!r} "
+            f"intent={intent} confidence={confidence} reason={reason!r}"
+        )
+
+        if intent == "none" or confidence < self._INTENT_THRESHOLD:
+            return  # below threshold → silent skip
+
+        is_group = event.get_message_type() == MessageType.GROUP_MESSAGE
+        is_admin = (
+            self.contact_service is not None
+            and self.contact_service.is_manager(open_id)
+        )
+
+        # ── Route by intent ───────────────────────────────────────────────
+        if intent == "generate_summary":
+            if not is_admin:
+                return  # unauthorized — silent skip, no error to user
+            event.stop_event()
+            if is_group:
+                yield event.plain_result("正在为您加载部门管理视图，请到私聊查看 📊")
+            try:
+                if self.card_service.is_fully_bound(open_id):
+                    await self._admin_view_pipeline(open_id)
+                else:
+                    await self.card_service.send_not_binding_card(open_id)
+            except Exception as e:
+                logger.error(f"[NaturalTrigger] 管理员流程失败: {e}")
+            return
+
+        if intent == "get_writing_folder":
+            event.stop_event()
+            try:
+                reply = await self._build_writing_folder_reply(open_id)
+            except Exception as e:
+                logger.error(f"[NaturalTrigger] 查询周报文件夹失败: {e}")
+                reply = "查询周报文件夹时出错，请稍后重试或联系部门负责人。"
+            yield event.plain_result(reply)
+            return
+
+    async def _build_writing_folder_reply(self, open_id: str) -> str:
+        """Resolve the requester's dept → folder URL → user-facing reply text.
+
+        URL is built deterministically from FEISHU_DRIVE_FOLDER_URL_PREFIX
+        plus the stored token, so no per-binding URL storage is needed.
+
+        Two states:
+          1. User not in any dept → contact admin
+          2. Dept found but folder unbound → ask manager to bind
+          3. Folder bound → return prefix+token URL with a short instruction
+        """
+        from .utils.env_config import get_dept_folder_url
+
+        org_tree = await self.contact_service.get_cached_org_tree()
+        dept_entry = next(
+            (e for e in org_tree
+             if any(getattr(m, "open_id", None) == open_id for m in e.get("members", []))),
+            None,
+        )
+        if not dept_entry:
+            return "未在通讯录中找到您的部门，请联系管理员核对。"
+
+        dept = dept_entry["dept"]
+        dept_name    = dept.name or ""
+        open_dept_id = getattr(dept, "open_department_id", "") or ""
+
+        url = get_dept_folder_url(open_dept_id)
+        if url:
+            return (
+                f"📂 {dept_name} 本周周报文件夹：\n{url}\n\n"
+                f"请进入文件夹，找到本周对应的周报文档/多维表格并填写您的内容～"
+            )
+
+        return (
+            f"{dept_name} 尚未绑定周报文件夹。请联系部门负责人执行 /文件夹配置 完成绑定。"
+        )
+
     CARD_KEYWORDS = ["周报", "帮助"]
     @filter.event_message_type(filter.EventMessageType.ALL)
     async def keyword_card_reply(self, event: AstrMessageEvent):
@@ -703,11 +873,14 @@ class MyPlugin(Star):
             # Replaces the previous summarize → rewrite two-card flow that
             # produced near-identical 草稿 / 总结 cards on most inputs.
             session_id = f"wrsbot_generate:{open_id}"
+            from .utils.manager_style import get_manager_style
+            style_profile = await get_manager_style(open_id)
             final = await self._stream_to_card(
                 open_id,
                 generate_report_stream(
                     content, dept_name, iso_tag, provider, session_id,
                     submitted=submitted, not_submitted=not_submitted,
+                    style_profile=style_profile,
                 ),
                 header_title=f"{dept_name} · {iso_tag} · 周报总结",
                 fallback_subtitle="周报总结",
@@ -763,6 +936,8 @@ class MyPlugin(Star):
             dept_name     = stored.get("dept_name", "")
             iso_week      = stored.get("iso_week", "")
             not_submitted = stored.get("not_submitted", []) or []
+            from .utils.manager_style import get_manager_style
+            style_profile = await get_manager_style(open_id)
             final = await self._stream_to_card(
                 open_id,
                 rewrite_summary_stream(
@@ -770,6 +945,7 @@ class MyPlugin(Star):
                     session_id=f"wrsbot_rewrite:{open_id}",
                     style_input=style_input,
                     not_submitted=not_submitted,
+                    style_profile=style_profile,
                 ),
                 header_title=f"{dept_name} · {iso_week} · 周报总结",
                 fallback_subtitle="周报总结",
@@ -1253,6 +1429,80 @@ class MyPlugin(Star):
 
         except Exception as e:
             logger.error(f"[Reminder] 提交提醒失败: {e}")
+
+    # ── Manager style profile pipelines ─────────────────────────────────────
+    async def _open_style_config_pipeline(self, open_id: str) -> None:
+        """Send the personal style config card pre-filled with the saved profile.
+
+        Triggered from the admin view card via the open_style_config action.
+        First-time managers get blanks; returning managers see their last save.
+        """
+        from .utils.manager_style import get_manager_style
+        try:
+            profile = await get_manager_style(open_id)
+            await self.card_service.send_style_config_card(
+                open_id,
+                tone_tags=profile["tone_tags"],
+                custom_instructions=profile["custom_instructions"],
+                writing_samples=profile["writing_samples"],
+                updated_at=profile["updated_at"],
+            )
+        except Exception as e:
+            logger.error(f"[StyleConfig] 打开风格配置失败: {e}")
+
+    async def _save_manager_style_pipeline(
+        self,
+        open_id: str,
+        tone_tags: list[str],
+        custom_instructions: str,
+        writing_samples: str,
+    ) -> None:
+        """Persist the form_value from the style config card to sp.
+
+        Called from the save_manager_style card action via create_task — the
+        sync action handler returns its toast immediately while this runs.
+        """
+        from .utils.manager_style import save_manager_style
+        try:
+            profile = await save_manager_style(
+                open_id,
+                tone_tags=tone_tags,
+                custom_instructions=custom_instructions,
+                writing_samples=writing_samples,
+            )
+            logger.info(
+                f"[StyleConfig] 已保存 open_id={open_id} "
+                f"tags={profile['tone_tags']} "
+                f"custom_len={len(profile['custom_instructions'])} "
+                f"sample_len={len(profile['writing_samples'])}"
+            )
+        except Exception as e:
+            logger.error(f"[StyleConfig] 保存风格失败: {e}")
+
+    async def _view_doc_pipeline(self, open_id: str) -> None:
+        """DM the caller's department folder URL as a text message.
+
+        Triggered by the view_doc card action. Reuses _build_writing_folder_reply
+        for dept lookup + URL resolution (covers unbound / no-URL / not-in-dept
+        cases with friendly fallback text). The toast is the card-side
+        feedback; the actual URL arrives here as a separate text DM so it
+        renders as a clickable link in Feishu.
+        """
+        if not self.lark_api:
+            return
+        from astrbot.core.platform.sources.lark.lark_event import LarkMessageEvent
+        try:
+            reply = await self._build_writing_folder_reply(open_id)
+            await LarkMessageEvent._send_im_message(
+                self.lark_api,
+                content=json.dumps({"text": reply}, ensure_ascii=False),
+                msg_type="text",
+                receive_id=open_id,
+                receive_id_type="open_id",
+            )
+            logger.info(f"[ViewDoc] 已发送文档链接: open_id={open_id}")
+        except Exception as e:
+            logger.error(f"[ViewDoc] 发送文档链接失败: {e}")
 
     @filter.command("test_feishu_doc")
     async def test_feishu_doc(self, event: AstrMessageEvent):
