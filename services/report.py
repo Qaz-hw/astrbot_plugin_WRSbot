@@ -22,13 +22,29 @@
 #    - Card definitions (lives in services/lark_card.py)
 #=====================================================
 
+import asyncio
 import json
 import re
-from typing import AsyncGenerator
+from typing import AsyncGenerator, TypedDict
 from astrbot.api import logger
 from .bitable import BitableService
 from .doc import DocService
 from .contact import ContactService
+
+
+# ── Map-reduce types ──────────────────────────────────────────────────────────
+# Used by generate_report_stream_mapreduce (variant 1). Each employee's raw
+# report becomes one EmployeeFacts via extract_employee_facts; the reducer
+# consumes a list of these.
+
+class EmployeeFacts(TypedDict):
+    """Structured facts extracted from ONE employee's weekly report."""
+    name:          str        # employee name as it appears in 通讯录 / 表格
+    kpi:           list[str]  # results, launches, closed loops, quantified outcomes
+    projects:      list[str]  # in-flight project milestones (not yet closed)
+    risks:         list[str]  # blockers, delays, quality/launch concerns
+    next_week:     list[str]  # explicit next-week actions
+    quality_note:  str        # "" if fine; short phrase if sparse/vague/off-topic
 
 
 # ── Markdown → plain text helpers ──────────────────────────────────────────
@@ -184,6 +200,29 @@ def _build_generate_prompt(
     )
     if not_submitted:
         user += "\n注意：上方「未提交」名单非空，必须在正文前输出「说明」段落列出这些成员。"
+
+    # ── Verbose prompt logging (only when a personal style profile is in use) ──
+    # Helps verify the manager's tone_tags / custom_instructions / writing_samples
+    # actually land in the prompt that hits the LLM. Gated on style_block so we
+    # don't spam logs for managers without a saved profile.
+    if style_block:
+        logger.info(
+            f"[Prompt][Generate] system_prompt: {len(_GENERATE_SYSTEM)} 字符 (constant _GENERATE_SYSTEM)"
+        )
+        if status_section:
+            logger.info(f"[Prompt][Generate] + status_section:\n{status_section.rstrip()}")
+        logger.info(f"[Prompt][Generate] + style_section (个人风格档案):\n{style_section.rstrip()}")
+        logger.info(
+            f"[Prompt][Generate] + content header: 【{dept_name}】{iso_week} "
+            f"({len(content)} 字符 raw content omitted)"
+        )
+        if not_submitted:
+            logger.info(
+                f"[Prompt][Generate] + tail note: 必须输出说明段落 "
+                f"(not_submitted={not_submitted})"
+            )
+        logger.info(f"[Prompt][Generate] total user prompt: {len(user)} 字符")
+
     return _GENERATE_SYSTEM, user
 
 
@@ -243,6 +282,25 @@ def _build_rewrite_prompt(
         f"请将以下周报草稿按照上述规则进行改写：\n\n"
         f"---\n{draft}\n---"
     )
+
+    # ── Verbose prompt logging (only when a personal style profile is in use) ──
+    # Mirrors the generate path so rewrite calls also expose what's actually
+    # being sent. Gated on profile_block — style_input alone (no saved profile)
+    # doesn't trigger verbose logs.
+    if profile_block:
+        logger.info(
+            f"[Prompt][Rewrite] system_prompt: {len(_REWRITE_SYSTEM)} 字符 (constant _REWRITE_SYSTEM)"
+        )
+        if style_section:
+            logger.info(f"[Prompt][Rewrite] + style_section (用户即席改写要求):\n{style_section.rstrip()}")
+        logger.info(f"[Prompt][Rewrite] + profile_section (个人风格档案):\n{profile_section.rstrip()}")
+        if context_section:
+            logger.info(f"[Prompt][Rewrite] + context_section:\n{context_section.rstrip()}")
+        logger.info(
+            f"[Prompt][Rewrite] + draft: {len(draft)} 字符 raw draft omitted"
+        )
+        logger.info(f"[Prompt][Rewrite] total user prompt: {len(user)} 字符")
+
     return _REWRITE_SYSTEM, user
 
 
@@ -510,6 +568,331 @@ async def generate_report_stream(
     )
     stream = llm_provider.text_chat_stream(
         prompt=usr_p, system_prompt=sys_p, session_id=session_id,
+    )
+    async for snapshot in _consume_provider_stream(stream):
+        yield snapshot
+
+
+# ── Map-reduce report generation ──────────────────────────────────────────────
+# Variant 1: per-employee fact extraction (parallel, small) → single reducer
+# (streaming, full report). The map phase bounds attention per call (each
+# call sees ONE employee), making the architecture scalable to large depts
+# without quality degradation. The reduce phase preserves the existing
+# CardKit streaming UX since only its output streams to the user.
+#
+# Two new system prompts:
+#   _EXTRACT_FACTS_SYSTEM — runs N times in parallel, one per employee
+#   _REDUCE_SYSTEM        — runs once, takes structured facts → final report
+#
+# The reduce prompt differs from _GENERATE_SYSTEM: it explicitly tells the
+# model the input is already-extracted structured facts, so it should focus
+# on synthesis / dedup / executive-style writing, NOT re-extraction.
+
+_EXTRACT_FACTS_SYSTEM = """你是一名周报事实提取助手。
+
+输入：一名员工本周的原始周报。
+输出：把该员工本周的所有事实归入四个类别，输出严格 JSON。
+
+四个类别：
+- kpi:        已完成、已上线、已闭环、量化结果（如：完成 X，提升 Y 至 Z%）
+- projects:   仍在推进的项目里程碑（未闭环，下周或后续仍有动作）
+- risks:      当前阻塞 / 延期 / 质量或上线风险 / 跨组待对齐事项
+- next_week:  下周明确动作（不要复述本周完成项）
+
+提取规则：
+1. 严格保留：数字、百分比、JIRA/缺陷号、版本号、服务/模块名、日期、时间点
+2. 一条 bullet = 一个原子事实，简洁，避免"做了一些工作"这类含糊表述
+3. 如果某类别没有内容，返回空数组 []，禁止编造
+4. quality_note: 若该周报内容稀少 / 表述含糊 / 偏题，请用不超过 15 字写明；正常请留空字符串 ""
+
+仅输出 JSON，禁止任何额外文字或代码块包裹：
+{"kpi": [...], "projects": [...], "risks": [...], "next_week": [...], "quality_note": "..."}"""
+
+
+def _build_extract_facts_prompt(name: str, raw_report: str) -> tuple[str, str]:
+    user = (
+        f"员工姓名：{name}\n\n"
+        f"原始周报：\n---\n{raw_report}\n---\n\n"
+        f"请按规则提取并输出 JSON。"
+    )
+    return _EXTRACT_FACTS_SYSTEM, user
+
+
+async def extract_employee_facts(
+    name: str,
+    raw_report: str,
+    llm_provider,
+    session_id: str,
+) -> EmployeeFacts:
+    """[MAP] Extract structured facts from ONE employee's weekly report.
+
+    Small focused call: the LLM sees only one person's report, so attention
+    is fully on extracting facts (no cross-employee dedup needed at this
+    stage — the reducer handles that).
+
+    Args:
+        name:         employee name (used for traceability + reducer dedup)
+        raw_report:   the employee's raw weekly report text
+        llm_provider: AstrBot provider; same one used by the calling pipeline
+        session_id:   provider session tag (e.g. "wrsbot_extract:<open_id>:<name>")
+
+    Returns:
+        EmployeeFacts dict. On parse / LLM failure, returns an empty-fields
+        EmployeeFacts with quality_note populated so the reducer knows to
+        mention the failure rather than silently dropping the person.
+    """
+    sys_p, usr_p = _build_extract_facts_prompt(name, raw_report)
+    empty: EmployeeFacts = {
+        "name":         name,
+        "kpi":          [],
+        "projects":     [],
+        "risks":        [],
+        "next_week":    [],
+        "quality_note": "",
+    }
+    try:
+        resp = await llm_provider.text_chat(
+            prompt=usr_p, system_prompt=sys_p, session_id=session_id,
+        )
+    except Exception as e:
+        logger.warning(f"[Extract][{name}] LLM 调用失败: {e}")
+        return {**empty, "quality_note": "提取失败"}
+
+    raw = (resp.completion_text or "").strip()
+    if raw.startswith("```"):
+        # Strip code fences if the model added them despite the instruction
+        raw = raw.split("```")[1].lstrip("json").strip()
+
+    try:
+        parsed = json.loads(raw)
+    except json.JSONDecodeError as e:
+        logger.warning(f"[Extract][{name}] JSON 解析失败: {e} | 原始: {raw[:200]}")
+        return {**empty, "quality_note": "返回格式异常"}
+
+    if not isinstance(parsed, dict):
+        logger.warning(f"[Extract][{name}] LLM 返回非对象: {type(parsed).__name__}")
+        return {**empty, "quality_note": "返回格式异常"}
+
+    def _as_str_list(v) -> list[str]:
+        if not isinstance(v, list):
+            return []
+        return [str(x) for x in v if x]
+
+    return {
+        "name":         name,
+        "kpi":          _as_str_list(parsed.get("kpi")),
+        "projects":     _as_str_list(parsed.get("projects")),
+        "risks":        _as_str_list(parsed.get("risks")),
+        "next_week":    _as_str_list(parsed.get("next_week")),
+        "quality_note": str(parsed.get("quality_note", "") or ""),
+    }
+
+
+_REDUCE_SYSTEM = """你是互联网公司"部门管理周报助手"。你的任务是把多名员工已提取好的【结构化事实】，合成一份可直接发给管理层的部门周报。
+
+输入说明：
+你会收到一份事实清单，已按员工分组，每位员工的事实已按四类预先归类（kpi / projects / risks / next_week）。事实提取阶段已完成，你不需要重新解析原文。
+
+你的目标按优先级排序：
+A. 事实正确（事实清单已经标准化，逐字保留即可）
+B. 管理层一眼读懂
+C. 跨员工去重 + 重要性排序
+D. 风格统一
+
+硬性约束：
+1) 只使用事实清单中的内容。没有出现的事实不要补写。
+2) 数字、百分比、JIRA/缺陷号、版本号、服务/模块名、日期必须逐字保留。
+3) 跨员工去重：同一事项（同一项目名 > 同一 JIRA/版本号 > 同一目标结果 > 同一时间窗口）必须合并为一条。
+4) 同一事项不在不同章节重复堆砌：
+   - KPI 章节：写已完成 + 量化结果
+   - 项目章节：写仍在推进的里程碑
+   - 风险章节：写当前仍影响进度的阻塞
+   - 下周章节：写下周明确动作
+5) 若某事项已在 KPI 中写明"完成"，项目章节不要重复；只有仍有后续里程碑时才继续提及。
+6) 每条要点 1-2 句话，先写结果/状态，再写影响/后续。
+7) 章节内按重要性排序：线上与业务影响 > 关键项目里程碑 > 风险/延期 > 文档与内部优化。
+8) 人名默认不进入正文；只允许在「说明」段落中出现。
+9) 「说明」段落输出条件（满足任意一条即输出）：
+   - 存在 quality_note 非空的员工（列出姓名 + 原因）
+   - 用户在 user prompt 中提供了 not_submitted 名单
+   否则整段删除。
+10) 禁止空话/套话：总体来说、综上所述、首先/其次/最后、值得注意的是、稳步推进、为后续奠定基础、赋能、抓手、保驾护航。
+11) 优先词汇：完成、上线、修复、推进、联调、对齐、闭环、复盘、灰度、延期、阻塞、定稿、启动、交付、输出。
+12) 若某正式章节确无内容，用" - 无新增关键事项。"填充，不要删除章节。
+13) style_profile（若提供）只影响语气、抽象层级、压缩力度；不得改变事实、章节、排序与硬性约束。
+
+输出格式（严格）：
+#### 说明
+（仅在条件 9 满足时输出，否则整段删除）
+
+#### 本周KPI与业务进展
+- ...
+
+#### 重点项目进展
+- ...
+
+#### 风险与阻塞项
+- ...
+
+#### 下周计划
+- ...
+"""
+
+
+def _build_reduce_prompt(
+    facts_list: list[EmployeeFacts],
+    dept_name: str,
+    iso_week: str,
+    submitted: list[str] | None = None,
+    not_submitted: list[str] | None = None,
+    style_profile: dict | None = None,
+) -> tuple[str, str]:
+    from ..utils.manager_style import render_style_for_prompt
+
+    status_section = ""
+    if submitted is not None or not_submitted is not None:
+        status_section = (
+            f"本周提交情况（来自部门通讯录 + 提交检查）：\n"
+            f"- 已提交：{'、'.join(submitted) if submitted else '（无）'}\n"
+            f"- 未提交：{'、'.join(not_submitted) if not_submitted else '（无）'}\n\n"
+        )
+
+    # Personal style profile injection (same convention as single-call path)
+    style_block = render_style_for_prompt(style_profile)
+    style_section = (
+        f"## 个人风格档案（仅影响语气/措辞；不可改变事实、章节、排序与硬性约束）\n"
+        f"{style_block}\n\n"
+        if style_block else ""
+    )
+
+    # Serialize the facts list as compact JSON. The model reads structured
+    # input — no re-extraction needed.
+    facts_json = json.dumps(facts_list, ensure_ascii=False, indent=2)
+
+    user = (
+        f"{status_section}"
+        f"{style_section}"
+        f"部门：{dept_name}\n周次：{iso_week}\n\n"
+        f"以下是各成员本周事实清单（已结构化）：\n"
+        f"```json\n{facts_json}\n```\n\n"
+        f"请按照四章节格式合成面向管理层的部门周报。"
+    )
+    if not_submitted:
+        user += "\n注意：上方「未提交」名单非空，必须在正文前输出「说明」段落列出这些成员。"
+    if any(f.get("quality_note") for f in facts_list):
+        user += "\n注意：部分员工的 quality_note 非空，必须在「说明」段落中列出对应姓名 + 原因。"
+
+    # Verbose logging when a style profile is in use, matching the
+    # single-call path. Helps verify the reducer prompt actually carries
+    # the manager's voice anchors.
+    if style_block:
+        logger.info(
+            f"[Prompt][Reduce] system_prompt: {len(_REDUCE_SYSTEM)} 字符 (constant _REDUCE_SYSTEM)"
+        )
+        if status_section:
+            logger.info(f"[Prompt][Reduce] + status_section:\n{status_section.rstrip()}")
+        logger.info(f"[Prompt][Reduce] + style_section:\n{style_section.rstrip()}")
+        logger.info(
+            f"[Prompt][Reduce] + facts: {len(facts_list)} 人, "
+            f"{len(facts_json)} 字符 JSON"
+        )
+        logger.info(f"[Prompt][Reduce] total user prompt: {len(user)} 字符")
+
+    return _REDUCE_SYSTEM, user
+
+
+async def generate_report_stream_mapreduce(
+    employee_inputs: list[tuple[str, str]],
+    dept_name: str,
+    iso_week: str,
+    llm_provider,
+    session_id: str,
+    submitted: list[str] | None = None,
+    not_submitted: list[str] | None = None,
+    style_profile: dict | None = None,
+    semaphore: "asyncio.Semaphore | None" = None,
+) -> AsyncGenerator[str, None]:
+    """[ORCHESTRATOR] Map-reduce report generation (variant 1).
+
+    Workflow:
+        1. MAP — fan-out: extract_employee_facts() per employee in parallel,
+           bounded by the provided semaphore. Each call is small, focused,
+           cache-friendly (same system prompt across all calls).
+        2. REDUCE — single streaming call. Takes the list[EmployeeFacts]
+           plus dept context + style profile, synthesizes the final report.
+           Output streams snapshot-by-snapshot for CardKit display.
+
+    Pre-reduce snapshot: while map is running, yields short status snapshots
+    ("正在分析 N 个人的周报...") so the streaming card shows progress instead
+    of looking frozen. The reducer's first real snapshot replaces the status.
+
+    Args:
+        employee_inputs: list of (employee_name, raw_report_text). Caller is
+                         responsible for splitting per-employee (trivial for
+                         bitable: one record = one employee; doc path stays
+                         on single-call generate_report_stream for now).
+        dept_name:       department name for header context
+        iso_week:        ISO week tag (e.g. "2026-W21") for header context
+        llm_provider:    AstrBot provider, used for both map and reduce calls
+        session_id:      session tag prefix; per-employee map calls append :name
+        submitted /
+        not_submitted:   from check_submissions; passed to reducer for 说明 logic
+        style_profile:   personal style dict from manager_style.get_manager_style
+        semaphore:       LLM concurrency cap. Pass PipelineBase.llm_semaphore
+                         from the calling pipeline. If None, defaults to a
+                         fresh semaphore(8) — fine for testing, not production.
+
+    Yields:
+        Cumulative text snapshots suitable for the existing CardKit
+        streaming-card path (_stream_to_card in pipelines/_base.py).
+    """
+    if semaphore is None:
+        semaphore = asyncio.Semaphore(8)
+
+    n = len(employee_inputs)
+    logger.info(f"[MapReduce] start: dept={dept_name} N={n}")
+
+    # ── Pre-reduce progress snapshot ─────────────────────────────────────────
+    # The card needs SOMETHING to render before the reducer starts streaming.
+    # Yield a placeholder; gets overwritten by the reducer's first real chunk.
+    yield f"正在分析 {n} 位成员的本周周报…"
+
+    # ── MAP: parallel per-employee extraction ────────────────────────────────
+    async def _bounded_extract(name: str, raw: str) -> EmployeeFacts:
+        async with semaphore:
+            return await extract_employee_facts(
+                name, raw, llm_provider,
+                session_id=f"{session_id}:extract:{name}",
+            )
+
+    map_tasks = [
+        asyncio.create_task(_bounded_extract(name, raw))
+        for name, raw in employee_inputs
+    ]
+    # gather with return_exceptions=False — _bounded_extract already swallows
+    # per-employee errors into a quality_note, so no task should raise.
+    facts_list: list[EmployeeFacts] = list(await asyncio.gather(*map_tasks))
+
+    # Log map-phase summary so it's easy to see which employees produced thin output
+    for f in facts_list:
+        logger.info(
+            f"[MapReduce] extracted name={f['name']!r} "
+            f"kpi={len(f['kpi'])} proj={len(f['projects'])} "
+            f"risks={len(f['risks'])} next={len(f['next_week'])} "
+            f"quality_note={f['quality_note']!r}"
+        )
+
+    yield f"已分析 {n} 人，正在合成部门周报…"
+
+    # ── REDUCE: single streaming synthesis call ──────────────────────────────
+    sys_p, usr_p = _build_reduce_prompt(
+        facts_list, dept_name, iso_week,
+        submitted=submitted, not_submitted=not_submitted,
+        style_profile=style_profile,
+    )
+    stream = llm_provider.text_chat_stream(
+        prompt=usr_p, system_prompt=sys_p,
+        session_id=f"{session_id}:reduce",
     )
     async for snapshot in _consume_provider_stream(stream):
         yield snapshot

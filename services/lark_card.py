@@ -475,12 +475,31 @@ class LarkCardService:
             })
 
 
-        # Patches the CURRENT card (admin view) in-place into the style config
-        # card, pre-filled with this manager's saved profile. Sync sp read
-        # via get_manager_style_sync — no async hop, no DM, no "loading"
-        # flicker. The card flips immediately when the user clicks.
+        # Branched flow for personal style:
+        #   - First-time managers (no saved profile)  → editable template card
+        #     directly (faster onboarding, no extra click)
+        #   - Returning managers (has saved profile)  → inline display card
+        #     showing the saved values + [返回 / 重新生成风格] buttons.
+        # The display path exists because Feishu CardKit can't pre-fill the
+        # template card's multi-select + textarea defaults via template
+        # variables — so we surface the saved values via an inline JSON card.
         if action_key == "open_style_config":
-            logger.info("[Lark_card] 打开个人风格配置（in-place patch）")
+            from ..utils.manager_style import get_manager_style_sync
+            profile = get_manager_style_sync(open_id)
+            has_saved = bool(
+                profile.get("tone_tags")
+                or profile.get("custom_instructions")
+                or profile.get("writing_samples")
+            )
+
+            if has_saved:
+                logger.info(f"[Lark_card] open_style_config → 展示已保存风格 (open_id={open_id})")
+                return P2CardActionTriggerResponse({
+                    "card": self._build_style_display_card_data(profile),
+                })
+
+            # No saved profile — go straight to the editable template.
+            logger.info(f"[Lark_card] open_style_config → 直接打开编辑卡片 (无已保存) (open_id={open_id})")
             if not WRSBOT_STYLE_CONFIG_CARD_ID:
                 logger.warning("[Lark_card] WRSBOT_STYLE_CONFIG_CARD_ID 未配置")
                 return P2CardActionTriggerResponse({
@@ -491,6 +510,37 @@ class LarkCardService:
                             "zh_cn": "风格配置卡片未配置，请联系管理员",
                             "en_us": "Style config card not configured.",
                         },
+                    }
+                })
+            return P2CardActionTriggerResponse({
+                "card": {
+                    "type": "template",
+                    "data": {
+                        "template_id": WRSBOT_STYLE_CONFIG_CARD_ID,
+                        "template_variable": {
+                            "open_id":               open_id,
+                            "tone_tags_preselected": profile["tone_tags"],
+                            "custom_instructions":   profile["custom_instructions"],
+                            "writing_samples":       profile["writing_samples"],
+                            "updated_at":            profile["updated_at"] or "（尚未保存）",
+                        },
+                    },
+                }
+            })
+
+        # Triggered by the "重新生成风格" button on the display card. Patches
+        # to the editable style config template so the manager can submit a
+        # new version. Same behavior the old open_style_config had — kept
+        # separate so the display card stays the default entry point for
+        # returning managers.
+        if action_key == "edit_style_config":
+            logger.info(f"[Lark_card] edit_style_config → 打开编辑卡片 (open_id={open_id})")
+            if not WRSBOT_STYLE_CONFIG_CARD_ID:
+                logger.warning("[Lark_card] WRSBOT_STYLE_CONFIG_CARD_ID 未配置")
+                return P2CardActionTriggerResponse({
+                    "toast": {
+                        "type": "error",
+                        "content": "风格配置卡片未配置，请联系管理员",
                     }
                 })
             from ..utils.manager_style import get_manager_style_sync
@@ -531,8 +581,13 @@ class LarkCardService:
                 }
             })
 
+        # Two-stage patch for perceived speed:
+        #   1. Return the admin view card NOW with "加载中…" placeholders →
+        #      the card flips instantly, manager isn't stuck on the config card
+        #   2. Schedule the admin pipeline async → patches the SAME message
+        #      again with real submission status once check_submissions finishes
         if action_key == "cancel_update_style":
-            logger.info("[Lark_card] 取消风格配置 → 回到管理视图")
+            logger.info("[Lark_card] 取消风格配置 → 即时回到管理视图（占位）+ 异步刷新")
             if self._admin_pipeline_fn:
                 asyncio.create_task(
                     self._admin_pipeline_fn(open_id, message_id)
@@ -542,7 +597,8 @@ class LarkCardService:
                     "type": "info",
                     "content": "已取消",
                     "i18n": {"zh_cn": "已取消", "en_us": "Cancelled."},
-                }
+                },
+                "card": self._build_admin_view_loading_data(open_id),
             })
 
 
@@ -561,9 +617,10 @@ class LarkCardService:
                 asyncio.create_task(
                     self._save_style_fn(open_id, tone_tags, custom, samples)
                 )
-            # After save, patch back to the admin view so the manager returns
-            # to the parent surface. Pipeline runs async — card stays on the
-            # config card with "已保存" toast for ~1-2s, then patches in place.
+            # Same two-stage patch as cancel_update_style:
+            #   1. Return admin view card NOW with "加载中…" placeholders
+            #   2. Async admin pipeline patches the same message with real
+            #      submission status once check_submissions finishes.
             if self._admin_pipeline_fn:
                 asyncio.create_task(
                     self._admin_pipeline_fn(open_id, message_id)
@@ -573,7 +630,8 @@ class LarkCardService:
                     "type": "success",
                     "content": "风格已保存",
                     "i18n": {"zh_cn": "风格已保存", "en_us": "Style saved."},
-                }
+                },
+                "card": self._build_admin_view_loading_data(open_id),
             })
 
         # style_input: free-form style instructions from the manager's text input.
@@ -1093,6 +1151,126 @@ class LarkCardService:
             e for e in org_tree
             if e.get("manager") and e["manager"].open_id == open_id
         ]
+
+    def _build_style_display_card_data(self, profile: dict) -> dict:
+        """Build a view-only inline card showing the manager's saved style.
+
+        Used when open_style_config fires AND there's already a saved profile.
+        Display-only because the style template card's input fields can't be
+        pre-filled via Feishu template_variable (multi-select + textarea
+        defaults aren't accepted as variables). Showing the saved values in
+        an inline JSON card sidesteps that limitation entirely.
+
+        Two buttons:
+          - 返回 (action: cancel_update_style) — back to admin view, no change
+          - 重新生成风格 (action: edit_style_config) — opens the editable
+            style_config_card template
+        """
+        tags    = profile.get("tone_tags", []) or []
+        custom  = (profile.get("custom_instructions", "") or "").strip()
+        samples = (profile.get("writing_samples",   "") or "").strip()
+        updated = profile.get("updated_at", "") or "（尚未保存）"
+
+        tags_line   = "、".join(tags) if tags else "（未选择）"
+        custom_block  = custom or "（未填写）"
+        samples_block = samples or "（未填写）"
+
+        # Trim long samples in the display so the card doesn't dwarf the
+        # screen. Editing still sees the full text via the template card.
+        if len(samples_block) > 600:
+            samples_block = samples_block[:600] + "\n\n…（更多内容已省略，编辑时可查看完整版）"
+
+        markdown_body = (
+            f"**最后更新：** {updated}\n\n"
+            f"---\n\n"
+            f"**🏷️ 语气标签**\n\n{tags_line}\n\n"
+            f"**📝 自定义指令**\n\n{custom_block}\n\n"
+            f"**✍️ 撰写样本（节选）**\n\n{samples_block}"
+        )
+
+        return {
+            "type": "raw",
+            "data": {
+                "schema": "2.0",
+                "config": {"update_multi": True},
+                "header": {
+                    "title": {"tag": "plain_text", "content": "个人风格档案 · 当前版本"},
+                    "template": "purple",
+                },
+                "body": {
+                    "elements": [
+                        {"tag": "markdown", "content": markdown_body},
+                        {"tag": "hr"},
+                        {
+                            "tag": "column_set",
+                            "columns": [
+                                {
+                                    "tag": "column",
+                                    "width": "weighted",
+                                    "weight": 1,
+                                    "elements": [{
+                                        "tag": "button",
+                                        "text": {"tag": "plain_text", "content": "返回"},
+                                        "type": "default",
+                                        "width": "fill",
+                                        "behaviors": [{
+                                            "type": "callback",
+                                            "value": {"action": "cancel_update_style"},
+                                        }],
+                                    }],
+                                },
+                                {
+                                    "tag": "column",
+                                    "width": "weighted",
+                                    "weight": 1,
+                                    "elements": [{
+                                        "tag": "button",
+                                        "text": {"tag": "plain_text", "content": "重新生成风格"},
+                                        "type": "primary",
+                                        "width": "fill",
+                                        "behaviors": [{
+                                            "type": "callback",
+                                            "value": {"action": "edit_style_config"},
+                                        }],
+                                    }],
+                                },
+                            ],
+                        },
+                    ],
+                },
+            },
+        }
+
+    def _build_admin_view_loading_data(self, open_id: str) -> dict:
+        """Build a placeholder admin view card for instant patch-back.
+
+        Used by save_manager_style / cancel_update_style so the card flips
+        to the admin view *immediately* — the slow submission check runs in
+        the background and patches the same message again with real data
+        once it finishes. Dept name comes from the synchronous org-tree
+        cache; submission stats show 加载中… until the async refresh lands.
+        """
+        dept_name = ""
+        if self.contact_service:
+            managed = self._get_managed_depts(open_id)
+            if managed:
+                dept_name = managed[0]["dept"].name or ""
+        time_updated = datetime.now(timezone(timedelta(hours=8))).strftime("%Y-%m-%d %H:%M")
+        return {
+            "type": "template",
+            "data": {
+                "template_id": WRSBOT_ADMIN_VIEW_CARD_ID,
+                "template_variable": {
+                    "open_id":                          open_id,
+                    "dept_name":                        dept_name or "—",
+                    "time_updated":                     time_updated,
+                    "weekly_report_submission_status":  "加载中…",
+                    "heading_colour":                   "yellow",
+                    "submitted_names":                  "加载中…",
+                    "not_submitted_names":              "加载中…",
+                },
+            },
+        }
 
     def _build_not_binding_card_data(self, open_id: str, *, failed: bool = False) -> dict:
         """Return the card 'type'+'data' dict for the binding status card.

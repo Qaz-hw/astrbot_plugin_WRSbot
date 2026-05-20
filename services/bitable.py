@@ -161,6 +161,24 @@ class BitableService:
             )
         logger.debug(f"[Bitable] update_record: record_id={record_id} fields={list(fields.keys())}")
 
+    # Name-field candidates checked in order when splitting records per employee.
+    _NAME_FIELD_CANDIDATES = ("姓名", "名字", "name", "Name", "成员")
+
+    @staticmethod
+    def _format_field_value(val) -> str:
+        """Shared value formatter for records_to_text + record_to_text."""
+        if isinstance(val, list):
+            # Person field: [{"id": "ou_xxx", "name": "张三"}, ...]
+            # MultiSelect:  [{"text": "选项A"}, ...]
+            return ", ".join(
+                v.get("name") or v.get("text") or str(v)
+                for v in val
+                if isinstance(v, dict)
+            ) or str(val)
+        if isinstance(val, dict):
+            return val.get("text") or val.get("name") or str(val)
+        return str(val)
+
     @staticmethod
     def records_to_text(records: list[dict]) -> str:
         """Serialize bitable records to a readable text block for LLM consumption.
@@ -172,18 +190,40 @@ class BitableService:
         for i, rec in enumerate(records, 1):
             field_parts = []
             for key, val in rec["fields"].items():
-                if isinstance(val, list):
-                    # Person field: [{"id": "ou_xxx", "name": "张三"}, ...]
-                    # MultiSelect:  [{"text": "选项A"}, ...]
-                    text_val = ", ".join(
-                        v.get("name") or v.get("text") or str(v)
-                        for v in val
-                        if isinstance(v, dict)
-                    ) or str(val)
-                elif isinstance(val, dict):
-                    text_val = val.get("text") or val.get("name") or str(val)
-                else:
-                    text_val = str(val)
-                field_parts.append(f"{key}: {text_val}")
+                field_parts.append(f"{key}: {BitableService._format_field_value(val)}")
             lines.append(f"[记录 {i}]\n" + "\n".join(field_parts))
         return "\n\n".join(lines)
+
+    @staticmethod
+    def split_records_per_employee(records: list[dict]) -> list[tuple[str, str]]:
+        """Convert bitable records → list of (employee_name, raw_report_text).
+
+        Used by the map-reduce generate pipeline: each tuple becomes one
+        parallel extract_employee_facts call. The name comes from the first
+        matching field in _NAME_FIELD_CANDIDATES; if none match, falls back
+        to "未知成员 N" with the row index. The report text is the remaining
+        fields formatted "field: value" per line (the name field is omitted
+        to avoid redundancy — the name is already the tuple key).
+        """
+        out: list[tuple[str, str]] = []
+        for i, rec in enumerate(records, 1):
+            fields = rec.get("fields", {}) or {}
+            # Locate name
+            name = ""
+            for cand in BitableService._NAME_FIELD_CANDIDATES:
+                if cand in fields:
+                    name = BitableService._format_field_value(fields[cand]).strip()
+                    if name:
+                        break
+            if not name:
+                name = f"未知成员{i}"
+
+            # Build report text from remaining fields. Skip the matched name
+            # field so the prose doesn't redundantly restate the name.
+            parts: list[str] = []
+            for key, val in fields.items():
+                if key in BitableService._NAME_FIELD_CANDIDATES:
+                    continue
+                parts.append(f"{key}: {BitableService._format_field_value(val)}")
+            out.append((name, "\n".join(parts)))
+        return out
