@@ -20,6 +20,7 @@ from lark_oapi.api.bitable.v1 import (
     ListAppTableFieldRequest,
     ListAppTableRecordRequest,
     UpdateAppTableRecordRequest,
+    CreateAppTableRecordRequest,
     AppTableRecord,
 )
 from astrbot.api import logger
@@ -118,6 +119,29 @@ class BitableService:
                     return rec["record_id"]
         logger.warning(f"[Bitable] 未找到部门总结行: app={app_token} table={table_id}")
         return None
+
+    async def create_record(self, app_token: str, table_id: str, fields: dict) -> str:
+        """Create a single record in a Bitable table. Returns the new record_id.
+
+        Feishu's create API appends to the end of the underlying data — visual
+        position depends on the active view's sort, not insertion order.
+        """
+        body = AppTableRecord.builder().fields(fields).build()
+        req = (
+            CreateAppTableRecordRequest.builder()
+            .app_token(app_token)
+            .table_id(table_id)
+            .request_body(body)
+            .build()
+        )
+        resp = await self.lark_api.bitable.v1.app_table_record.acreate(req)
+        if not resp.success():
+            raise RuntimeError(
+                f"[Bitable] create_record 失败: code={resp.code} msg={resp.msg}"
+            )
+        record_id = (resp.data.record.record_id or "") if resp.data and resp.data.record else ""
+        logger.debug(f"[Bitable] create_record: record_id={record_id} fields={list(fields.keys())}")
+        return record_id
 
     async def update_record(self, app_token: str, table_id: str, record_id: str, fields: dict) -> None:
         """Update a single record's fields in a Bitable table."""

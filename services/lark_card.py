@@ -22,6 +22,7 @@
 import asyncio
 import json
 import os
+import uuid
 from datetime import datetime, timezone, timedelta
 from typing import TYPE_CHECKING
 
@@ -53,7 +54,7 @@ WRSBOT_NOT_BINDiNG_FEEDBACK_CARD_ID = os.getenv("WRSBOT_NOT_BINDiNG_FEEDBACK_CAR
 WRSBOT_ADMIN_VIEW_CARD_ID = os.getenv("WRSBOT_ADMIN_VIEW_CARD_ID", "AAqtVhgEFc7gG")
 WRSBOT_ADMIN_REPORT_SUMMARY_CHECK_CARD_ID = os.getenv("WRSBOT_ADMIN_REPORT_SUMMARY_CHECK_CARD_ID", "AAqtVXND6ex3t") #Report Submission check. triggered when starting weekly report summary when not everyone in the department is submitted their report 
 WRSBOT_CARD_USER_VIEW_ID = os.getenv("WRSBOT_CARD_USER_VIEW_ID", "AAqtDwcOM8ogx")
-# WRSBOT_CARD_ID = os.getenv("", "")
+WRSBOT_SUMMARY_REWRITE_CARD_ID = os.getenv("WRSBOT_SUMMARY_REWRITE_CARD_ID", "AAqtF6JbQ9ZBu")
 
 
 
@@ -66,6 +67,7 @@ class LarkCardService:
         self._generate_pipeline_fn = None
         self._rewrite_pipeline_fn  = None
         self._submit_pipeline_fn   = None
+        self._reminder_pipeline_fn = None
 
     def set_user_pipeline(self, fn) -> None:
         """Signature: async fn(open_id: str) -> None"""
@@ -85,6 +87,10 @@ class LarkCardService:
         self._generate_pipeline_fn = generate
         self._rewrite_pipeline_fn  = rewrite
         self._submit_pipeline_fn   = submit
+
+    def set_reminder_pipeline(self, fn) -> None:
+        """Signature: async fn(manager_open_id: str) -> None"""
+        self._reminder_pipeline_fn = fn
 
     # ── Dispatcher injection ─────────────────────────────────────────────────
 
@@ -136,45 +142,45 @@ class LarkCardService:
 
         # [TEST] Sends a new alarm card as a DM to the clicking user.
         # open_id: Feishu user ID of the person who clicked the button.
-        if action_key == "send_alarm":
-            logger.info("✅ 飞书卡片动作已在处理")
-            if self.lark_api:
-                asyncio.create_task(self.send_alarm_card("open_id", open_id))
-            return P2CardActionTriggerResponse({})
-
-        # [TEST] Marks an alarm as resolved and replaces the card with a resolved summary.
-        # notes_input: text typed by the resolver in the card's notes field.
-        # alarm_time:  original alarm timestamp carried in the button's action_value (set when alarm was created).
-        # complete_time: current UTC+8 time, generated here at resolution.
-        if action_key == "complete_alarm":
-            logger.info("✅ 飞书卡片动作已在处理")
-            form_value: dict = action.form_value or {} if action is not None else {}
-            notes = str(form_value.get("notes_input", ""))
-            alarm_time: str = action_value.get("time", "")
-            complete_time = datetime.now(timezone(timedelta(hours=8))).strftime(
-                "%Y-%m-%d %H:%M:%S (UTC+8)"
-            )
-            return P2CardActionTriggerResponse(
-                {
-                    "toast": {
-                        "type": "info",
-                        "content": "已处理完成！",
-                        "i18n": {"zh_cn": "已处理完成！", "en_us": "Resolved!"},
-                    },
-                    "card": {
-                        "type": "template",
-                        "data": {
-                            "template_id": ALERT_RESOLVED_CARD_ID,
-                            "template_variable": {
-                                "alarm_time": alarm_time,
-                                "open_id": open_id,
-                                "complete_time": complete_time,
-                                "notes": notes,
-                            },
-                        },
-                    },
-                }
-            )
+#        if action_key == "send_alarm":
+#            logger.info("✅ 飞书卡片动作已在处理")
+#            if self.lark_api:
+#                asyncio.create_task(self.send_alarm_card("open_id", open_id))
+#            return P2CardActionTriggerResponse({})
+#
+#        # [TEST] Marks an alarm as resolved and replaces the card with a resolved summary.
+#        # notes_input: text typed by the resolver in the card's notes field.
+#        # alarm_time:  original alarm timestamp carried in the button's action_value (set when alarm was created).
+#        # complete_time: current UTC+8 time, generated here at resolution.
+#        if action_key == "complete_alarm":
+#            logger.info("✅ 飞书卡片动作已在处理")
+#            form_value: dict = action.form_value or {} if action is not None else {}
+#            notes = str(form_value.get("notes_input", ""))
+#            alarm_time: str = action_value.get("time", "")
+#            complete_time = datetime.now(timezone(timedelta(hours=8))).strftime(
+#                "%Y-%m-%d %H:%M:%S (UTC+8)"
+#            )
+#            return P2CardActionTriggerResponse(
+#                {
+#                    "toast": {
+#                        "type": "info",
+#                        "content": "已处理完成！",
+#                        "i18n": {"zh_cn": "已处理完成！", "en_us": "Resolved!"},
+#                    },
+#                    "card": {
+#                        "type": "template",
+#                        "data": {
+#                            "template_id": ALERT_RESOLVED_CARD_ID,
+#                            "template_variable": {
+#                                "alarm_time": alarm_time,
+#                                "open_id": open_id,
+#                                "complete_time": complete_time,
+#                                "notes": notes,
+#                            },
+#                        },
+#                    },
+#                }
+#            )
         # ──WRSbot card action callback ─────────────────────────────────────────────────
 
         # ── WRSbot welcome card actions ──────────────────────────────────────────
@@ -366,6 +372,35 @@ class LarkCardService:
                 },
             })
 
+        # Triggered from the binding-success card when the manager wants to re-bind.
+        # Clears the existing folder token for this dept, then drops the user back into
+        # the tutorial card so they can paste a new folder URL.
+        # dept_id: open_department_id carried in action_value; falls back to the manager's
+        #          only managed dept for single-dept template cards (same fallback as start_binding).
+        if action_key == "bind_new_token":
+            logger.info("[Lark_card] 重新绑定文件夹")
+            from ..utils.env_config import delete_dept_folder_token
+
+            dept_id = action_value.get("dept_id", "")
+            if not dept_id:
+                managed = self._get_managed_depts(open_id)
+                if managed:
+                    dept_id = getattr(managed[0]["dept"], "open_department_id", "") or ""
+
+            if dept_id:
+                delete_dept_folder_token(dept_id)
+                logger.info(f"[Lark_card] 已清除绑定: dept={dept_id}")
+
+            return P2CardActionTriggerResponse({
+                "card": {
+                    "type": "template",
+                    "data": {
+                        "template_id": WRSBOT_BINDFOLDER_TUTORIAL_CARD_ID,
+                        "template_variable": {"open_id": open_id, "dept_id": dept_id},
+                    },
+                }
+            })
+
         # Kicks off a background org tree refresh without blocking the card response.
         # create_task() schedules _do_refresh() on the running event loop; the handler returns
         # immediately with the current (pre-refresh) binding card so the user isn't left waiting.
@@ -396,12 +431,49 @@ class LarkCardService:
                 asyncio.create_task(self._generate_pipeline_fn(open_id, message_id))
             return P2CardActionTriggerResponse({"card": {"type": "raw", "data": _GENERATING_CARD}})
 
+        # Triggered from the admin view card. Looks up this week's not_submitted
+        # list and DMs each of those members the user_view_card as a nudge.
+        # Toast returns immediately; the per-user DM fan-out runs in background.
+        if action_key == "summary_reminder":
+            logger.info("[Lark_card] 发送提交提醒")
+            if self._reminder_pipeline_fn:
+                asyncio.create_task(self._reminder_pipeline_fn(open_id))
+            return P2CardActionTriggerResponse({
+                "toast": {
+                    "type": "info",
+                    "content": "已向未提交成员发送提醒卡片",
+                    "i18n": {
+                        "zh_cn": "已向未提交成员发送提醒卡片",
+                        "en_us": "Reminder cards sent to pending members.",
+                    },
+                }
+            })
+
         # style_input: free-form style instructions from the manager's text input.
         # Reruns only the rewrite pass against the draft stored in sp.
         if action_key == "rewrite_summary":
             logger.info("[Lark_card] 重新改写周报总结")
+            # Diagnostic: dump every value-carrying field on the action so we
+            # can see exactly where Feishu placed the input. form_value is the
+            # form-submit path; input_value is the direct-callback path; value
+            # is the button's own action_value dict.
+            logger.warning(
+                "[Lark_card] rewrite_summary action dump: "
+                f"tag={getattr(action, 'tag', None)!r} "
+                f"name={getattr(action, 'name', None)!r} "
+                f"value={getattr(action, 'value', None)!r} "
+                f"form_value={getattr(action, 'form_value', None)!r} "
+                f"input_value={getattr(action, 'input_value', None)!r} "
+                f"option={getattr(action, 'option', None)!r} "
+                f"options={getattr(action, 'options', None)!r}"
+            )
             form_value: dict = action.form_value or {} if action is not None else {}
+            # Try form_value first (form-submit path), then input_value (direct
+            # callback path). Whichever is non-empty wins.
             style_input = str(form_value.get("style_input", "")).strip()
+            if not style_input:
+                style_input = str(getattr(action, "input_value", "") or "").strip()
+            logger.info(f"[Lark_card] style_input: {style_input!r}")
             if self._rewrite_pipeline_fn:
                 asyncio.create_task(self._rewrite_pipeline_fn(open_id, style_input))
             return P2CardActionTriggerResponse({
@@ -471,10 +543,14 @@ class LarkCardService:
         return True
 
     async def patch_inline_card(self, message_id: str, card_json: dict) -> bool:
-        """Patch an existing message in-place with a raw (non-template) card JSON."""
+        """Patch an existing message in-place with a raw (non-template) card JSON.
+
+        Patch API takes the card JSON directly as content — no {"type":"raw","data":...}
+        wrapper. That wrapper is only valid in P2CardActionTriggerResponse, not here.
+        """
         from lark_oapi.api.im.v1 import PatchMessageRequest, PatchMessageRequestBody
 
-        content = json.dumps({"type": "raw", "data": card_json}, ensure_ascii=False)
+        content = json.dumps(card_json, ensure_ascii=False)
         req = (
             PatchMessageRequest.builder()
             .message_id(message_id)
@@ -515,94 +591,30 @@ class LarkCardService:
             receive_id_type=receive_id_type,
         )
 
-    async def send_welcome_card(self, open_id: str) -> bool:
-        """Send the welcome card to a user by open_id."""
-        if not WELCOME_CARD_ID:
-            logger.warning("[Lark_card] WELCOME_CARD_ID 未设置，跳过发送欢迎卡片")
-            return False
-        return await self.send_template_card(
-            "open_id", open_id, WELCOME_CARD_ID, {"open_id": open_id}
-        )
+    # ── Testing functions, disabled when unused ─────────────────────────────────────────────────────────
 
-    async def send_alarm_card(self, receive_id_type: str, receive_id: str) -> bool:
-        """Send the alarm card with current UTC+8 timestamp."""
-        if not ALERT_CARD_ID:
-            logger.warning("[Lark_card] ALERT_CARD_ID 未设置，跳过发送告警卡片")
-            return False
-        alarm_time = datetime.now(timezone(timedelta(hours=8))).strftime(
-            "%Y-%m-%d %H:%M:%S (UTC+8)"
-        )
-        return await self.send_template_card(
-            receive_id_type, receive_id, ALERT_CARD_ID, {"alarm_time": alarm_time}
-        )
+#    async def send_welcome_card(self, open_id: str) -> bool:
+#        """Send the welcome card to a user by open_id."""
+#        if not WELCOME_CARD_ID:
+#            logger.warning("[Lark_card] WELCOME_CARD_ID 未设置，跳过发送欢迎卡片")
+#            return False
+#        return await self.send_template_card(
+#            "open_id", open_id, WELCOME_CARD_ID, {"open_id": open_id}
+#        )
+#
+#    async def send_alarm_card(self, receive_id_type: str, receive_id: str) -> bool:
+#        """Send the alarm card with current UTC+8 timestamp."""
+#        if not ALERT_CARD_ID:
+#            logger.warning("[Lark_card] ALERT_CARD_ID 未设置，跳过发送告警卡片")
+#            return False
+#        alarm_time = datetime.now(timezone(timedelta(hours=8))).strftime(
+#            "%Y-%m-%d %H:%M:%S (UTC+8)"
+#        )
+#        return await self.send_template_card(
+#            receive_id_type, receive_id, ALERT_CARD_ID, {"alarm_time": alarm_time}
+#        )
+#
 
-    async def send_keyword_card(
-        self,
-        sender_name: str,
-        matched_keyword: str,
-        text: str,
-        reply_message_id: str,
-    ) -> None:
-        """Send the keyword trigger card as a reply to the original message."""
-        from astrbot.core.platform.sources.lark.lark_event import LarkMessageEvent
-
-        card_json = {
-            "schema": "2.0",
-            "header": {
-                "title": {"tag": "plain_text", "content": f"WRSbot · 检测到关键词「{matched_keyword}」"},
-                "template": "blue",
-            },
-            "body": {
-                "elements": [
-                    {
-                        "tag": "markdown",
-                        "content": f"**来自：** {sender_name}\n**消息：** {text}",
-                    },
-                    {"tag": "hr"},
-                    {
-                        "tag": "column_set",
-                        "flex_mode": "none",
-                        "columns": [
-                            {
-                                "tag": "column",
-                                "width": "weighted",
-                                "weight": 1,
-                                "elements": [
-                                    {
-                                        "tag": "button",
-                                        "text": {"tag": "plain_text", "content": "查看指令列表"},
-                                        "type": "default",
-                                        "behaviors": [
-                                            {"type": "callback", "value": {"action": "show_commands"}}
-                                        ],
-                                    }
-                                ],
-                            },
-                            {
-                                "tag": "column",
-                                "width": "weighted",
-                                "weight": 1,
-                                "elements": [
-                                    {
-                                        "tag": "button",
-                                        "text": {"tag": "plain_text", "content": "开始生成周报"},
-                                        "type": "primary",
-                                        "behaviors": [
-                                            {"type": "callback", "value": {"action": "start_report"}}
-                                        ],
-                                    }
-                                ],
-                            },
-                        ],
-                    },
-                ]
-            },
-        }
-        await LarkMessageEvent._send_interactive_card(
-            card_json,
-            lark_client=self.lark_api,
-            reply_message_id=reply_message_id,
-        )
 
     # ── WRSbot workflow cards sending ─────────────────────────────────────────────────────────
 
@@ -614,6 +626,68 @@ class LarkCardService:
         return await self. send_template_card(
             "open_id", open_id, WRSBOT_WELCOME_CARD_ID,{"open_id": open_id}
         )
+
+    # ── Folder binding status ────────────────────────────────────────────────
+
+    def is_fully_bound(self, open_id: str) -> bool:
+        """True if every department this user manages has a folder token in .env.
+
+        Returns False if the user manages no departments at all (no point
+        showing a success card to a non-manager).
+        """
+        from ..utils.env_config import get_dept_folder_token
+
+        managed = self._get_managed_depts(open_id)
+        if not managed:
+            return False
+        return all(
+            bool(get_dept_folder_token(getattr(e["dept"], "open_department_id", "") or ""))
+            for e in managed
+        )
+
+    async def send_binding_success_card(self, open_id: str) -> bool:
+        """Send the binding-success template card to a user as a DM."""
+        managed = self._get_managed_depts(open_id)
+        if not managed:
+            dept_name = "未知部门"
+        elif len(managed) == 1:
+            dept_name = managed[0]["dept"].name or ""
+        else:
+            dept_name = "所有部门"
+        return await self.send_template_card(
+            "open_id", open_id, WRSBOT_BINDING_FEEDBACK_SUCCESS_CARD_ID,
+            {"open_id": open_id, "dept_name": dept_name},
+        )
+
+    async def send_not_binding_card(self, open_id: str) -> None:
+        """Send the folder-binding status card to a user as a DM.
+
+        Routes between single-dept template card and multi-dept inline JSON
+        card via _build_not_binding_card_data. Note that _build_not_binding_card_data
+        will *itself* return a success card if everything is bound — callers
+        who specifically want the not-binding view should gate this with
+        `not is_fully_bound(open_id)` first.
+        """
+        from astrbot.core.platform.sources.lark.lark_event import LarkMessageEvent
+
+        card_data = self._build_not_binding_card_data(open_id)
+        card_type = card_data.get("type", "")
+        data = card_data.get("data", {})
+
+        if card_type == "template":
+            await self.send_template_card(
+                "open_id", open_id,
+                data["template_id"],
+                data.get("template_variable", {}),
+            )
+        else:  # raw inline card (multi-dept)
+            await LarkMessageEvent._send_im_message(
+                self.lark_api,
+                content=json.dumps(data, ensure_ascii=False),
+                msg_type="interactive",
+                receive_id=open_id,
+                receive_id_type="open_id",
+            )
 
 
     # ── Admin view ───────────────────────────────────────────────────────────────
@@ -672,38 +746,179 @@ class LarkCardService:
 
     async def send_generated_success_card(self, message_id: str) -> None:
         """Patch the 'generating' card in-place with the 'generated successfully' notice."""
-        await self.patch_inline_card(message_id, _GENERATED_SUCCESS_CARD)
+        # Using official Feishu CardKit template (WRSBOT_SUMMARY_REWRITE_CARD_ID)
+        # instead of the inline _SUMMARY_ACTION_CARD — inline-form binding has
+        # been unreliable for form_value. Template card handles form logic in
+        # Feishu's card builder.
+        await self.patch_card(message_id, WRSBOT_SUMMARY_REWRITE_CARD_ID, {})
+        # await self.patch_inline_card(message_id, _SUMMARY_ACTION_CARD)
 
-    async def send_report_content_card(
-        self,
-        open_id: str,
-        report_text: str,
-        dept_name: str = "",
-        iso_week: str = "",
-    ) -> None:
-        """Send the report markdown as a Lark card so headers/bullets render properly."""
+    # ── CardKit streaming helpers ────────────────────────────────────────────
+    # Used by main.py's _stream_to_card to render LLM output token-by-token
+    # via Feishu's CardKit streaming card. Mirrors the in-tree implementation
+    # at lark_event.py:780-937 but bound to self.lark_api so it can run from
+    # a card-callback pipeline (no LarkMessageEvent instance available there).
+    #
+    # Why duplicate AstrBot's helpers instead of reusing them:
+    #   1. LarkMessageEvent.send_streaming (the high-level orchestrator) is
+    #      instance-bound — it needs self.message_obj.message_id (for reply
+    #      context), self.platform_meta.name (metric tagging), and calls
+    #      super().send() for framework-level side effects. Our trigger is a
+    #      card-button callback dispatched via asyncio.create_task: no event
+    #      instance, no incoming user message to reply to, sending an active
+    #      DM to open_id. It doesn't drop in.
+    #   2. The lower-level helpers (_create_streaming_card, _send_card_message,
+    #      _update_streaming_text, _close_streaming_mode) only touch self.bot,
+    #      so technically callable with our lark_api — but they're private
+    #      _underscore instance methods. Calling them from outside the class
+    #      couples us to AstrBot internals; a rename at any version bump
+    #      silently breaks us.
+    # Re-implementing here keeps us stable across AstrBot versions. If those
+    # helpers ever become @staticmethod on a public surface, switch to them.
+
+    async def create_streaming_card(self, header_title: str = "") -> str | None:
+        """Create a CardKit streaming card entity. Returns card_id or None."""
+        if not self.lark_api or self.lark_api.cardkit is None:
+            logger.error("[LarkCard] CardKit 模块未初始化")
+            return None
+
+        from lark_oapi.api.cardkit.v1 import CreateCardRequest, CreateCardRequestBody
+
+        card_json = {
+            "schema": "2.0",
+            "header": {"title": {"content": header_title, "tag": "plain_text"}},
+            "config": {
+                "streaming_mode": True,
+                "summary": {"content": ""},
+                "streaming_config": {
+                    "print_frequency_ms": {"default": 50},
+                    "print_step": {"default": 2},
+                    "print_strategy": "fast",
+                },
+            },
+            "body": {
+                "elements": [
+                    {"tag": "markdown", "content": "", "element_id": "markdown_1"}
+                ]
+            },
+        }
+
+        req = (
+            CreateCardRequest.builder()
+            .request_body(
+                CreateCardRequestBody.builder()
+                .type("card_json")
+                .data(json.dumps(card_json, ensure_ascii=False))
+                .build()
+            )
+            .build()
+        )
+        try:
+            resp = await self.lark_api.cardkit.v1.card.acreate(req)
+        except Exception as e:
+            logger.error(f"[LarkCard] 创建流式卡片失败: {e}")
+            return None
+        if not resp.success() or resp.data is None or not resp.data.card_id:
+            logger.error(f"[LarkCard] 创建流式卡片失败({resp.code}): {resp.msg}")
+            return None
+        return resp.data.card_id
+
+    async def send_streaming_card_to_user(self, open_id: str, card_id: str) -> bool:
+        """Deliver a CardKit card entity as an interactive DM."""
         from astrbot.core.platform.sources.lark.lark_event import LarkMessageEvent
 
-        card = _build_report_content_card(report_text, dept_name, iso_week)
-        await LarkMessageEvent._send_im_message(
+        content = json.dumps(
+            {"type": "card", "data": {"card_id": card_id}}, ensure_ascii=False
+        )
+        return await LarkMessageEvent._send_im_message(
             self.lark_api,
-            content=json.dumps(card, ensure_ascii=False),
+            content=content,
             msg_type="interactive",
             receive_id=open_id,
             receive_id_type="open_id",
         )
+
+    async def update_streaming_text(
+        self, card_id: str, content: str, sequence: int
+    ) -> bool:
+        """Push the full accumulated text to the streaming card's markdown_1 element."""
+        if not self.lark_api or self.lark_api.cardkit is None:
+            return False
+
+        from lark_oapi.api.cardkit.v1 import (
+            ContentCardElementRequest,
+            ContentCardElementRequestBody,
+        )
+
+        req = (
+            ContentCardElementRequest.builder()
+            .card_id(card_id)
+            .element_id("markdown_1")
+            .request_body(
+                ContentCardElementRequestBody.builder()
+                .content(content)
+                .sequence(sequence)
+                .uuid(str(uuid.uuid4()))
+                .build()
+            )
+            .build()
+        )
+        try:
+            resp = await self.lark_api.cardkit.v1.card_element.acontent(req)
+        except Exception as e:
+            logger.debug(f"[LarkCard] 流式更新失败 (ignored): {e}")
+            return False
+        if not resp.success():
+            logger.debug(f"[LarkCard] 流式更新失败({resp.code}): {resp.msg}")
+            return False
+        return True
+
+    async def close_streaming_card(self, card_id: str, sequence: int) -> None:
+        """Close streaming mode so the card is forwardable / static afterwards."""
+        if not self.lark_api or self.lark_api.cardkit is None:
+            return
+
+        from lark_oapi.api.cardkit.v1 import SettingsCardRequest, SettingsCardRequestBody
+
+        settings = json.dumps(
+            {"config": {"streaming_mode": False}}, ensure_ascii=False
+        )
+        req = (
+            SettingsCardRequest.builder()
+            .card_id(card_id)
+            .request_body(
+                SettingsCardRequestBody.builder()
+                .settings(settings)
+                .sequence(sequence)
+                .uuid(str(uuid.uuid4()))
+                .build()
+            )
+            .build()
+        )
+        try:
+            resp = await self.lark_api.cardkit.v1.card.asettings(req)
+        except Exception as e:
+            logger.error(f"[LarkCard] 关闭流式异常: {e}")
+            return
+        if not resp.success():
+            logger.warning(f"[LarkCard] 关闭流式失败({resp.code}): {resp.msg}")
 
     async def send_summary_action_card(self, open_id: str) -> None:
         """Send the post-generation action card with rewrite input and two buttons."""
-        from astrbot.core.platform.sources.lark.lark_event import LarkMessageEvent
-
-        await LarkMessageEvent._send_im_message(
-            self.lark_api,
-            content=json.dumps(_SUMMARY_ACTION_CARD, ensure_ascii=False),
-            msg_type="interactive",
-            receive_id=open_id,
-            receive_id_type="open_id",
+        # Using official Feishu CardKit template (WRSBOT_SUMMARY_REWRITE_CARD_ID)
+        # instead of the inline _SUMMARY_ACTION_CARD — see send_generated_success_card
+        # for rationale.
+        await self.send_template_card(
+            "open_id", open_id, WRSBOT_SUMMARY_REWRITE_CARD_ID, {}
         )
+        # from astrbot.core.platform.sources.lark.lark_event import LarkMessageEvent
+        # await LarkMessageEvent._send_im_message(
+        #     self.lark_api,
+        #     content=json.dumps(_SUMMARY_ACTION_CARD, ensure_ascii=False),
+        #     msg_type="interactive",
+        #     receive_id=open_id,
+        #     receive_id_type="open_id",
+        # )
 
     # ── Binding status helpers (sync — reads from cached org tree) ──────────────
 
@@ -969,6 +1184,7 @@ def _build_multi_dept_binding_card(managed_depts: list[dict]) -> dict:
 
 _GENERATING_CARD = {
     "schema": "2.0",
+    "config": {"update_multi": True},
     "header": {
         "title": {"tag": "plain_text", "content": "正在生成周报总结..."},
         "template": "blue",
@@ -983,109 +1199,59 @@ _GENERATING_CARD = {
     },
 }
 
-_GENERATED_SUCCESS_CARD = {
-    "schema": "2.0",
-    "config": {
-        "wide_screen_mode": True
-    },
-    "header": {
-        "title": {
-            "tag": "plain_text",
-            "content": "周报总结已生成"
-        },
-        "template": "green",
-    },
-    "body": {
-        "elements": [
-            {
-                "tag": "div",
-                "text": {
-                    "tag": "lark_md",
-                    "content": "部门周报总结已生成完成，结果已通过私信发送。  \n可在私信中选择重新改写或写入文档。"
-                }
-            }
-        ]
-    },
-}
-
-
-# ── Report content card ─────────────────────────────────────────────────────
-# Wraps the LLM-generated report in a Lark card so the ## / - / ** markdown
-# actually renders. Sent as a new DM between the success notice and the
-# action card.
-
-def _build_report_content_card(report_text: str, dept_name: str = "", iso_week: str = "") -> dict:
-    header_title = " · ".join(p for p in (dept_name, iso_week, "周报总结") if p)
-    return {
-        "schema": "2.0",
-        "header": {
-            "title": {"tag": "plain_text", "content": header_title},
-            "template": "blue",
-        },
-        "body": {
-            "elements": [
-                {"tag": "markdown", "content": report_text},
-            ]
-        },
-    }
-
 
 # ── Post-generation action card ──────────────────────────────────────────────
-# Sent as a plain DM immediately after the summary text message.
-# Contains a style input field + two action buttons.
-
-_SUMMARY_ACTION_CARD = {
-    "schema": "2.0",
-    "header": {
-        "title": {"tag": "plain_text", "content": "周报总结已生成"},
-        "template": "green",
-    },
-    "body": {
-        "elements": [
-            {
-                "tag": "markdown",
-                "content": "请选择下一步操作。如需按特定风格改写，在下方输入要求后点击「重新改写」。",
-            },
-            {"tag": "hr"},
-            {
-                "tag": "input",
-                "name": "style_input",
-                "placeholder": {"tag": "plain_text", "content": "改写风格要求（可选）：如「更简洁」、「突出结果」、「偏向老板汇报风格」"},
-            },
-            {"tag": "hr"},
-            {
-                "tag": "column_set",
-                "flex_mode": "none",
-                "columns": [
-                    {
-                        "tag": "column",
-                        "width": "weighted",
-                        "weight": 1,
-                        "elements": [{
-                            "tag": "button",
-                            "text": {"tag": "plain_text", "content": "重新改写"},
-                            "type": "default",
-                            "width": "fill",
-                            "behaviors": [{"type": "callback", "value": {"action": "rewrite_summary"}}],
-                        }],
-                    },
-                    {
-                        "tag": "column",
-                        "width": "weighted",
-                        "weight": 1,
-                        "elements": [{
-                            "tag": "button",
-                            "text": {"tag": "plain_text", "content": "写入文档 →"},
-                            "type": "primary",
-                            "width": "fill",
-                            "behaviors": [{"type": "callback", "value": {"action": "submit_summary"}}],
-                        }],
-                    },
-                ],
-            },
-        ]
-    },
-}
+# DEPRECATED: replaced by the official Feishu CardKit template
+# WRSBOT_SUMMARY_REWRITE_CARD_ID. Inline form-binding for `style_input` proved
+# unreliable (form_value came back empty even with form_action_type: submit
+# and a flattened structure). The template card handles the form in Feishu's
+# card builder, which should resolve form_value delivery.
+# Kept commented for reference / quick revert.
+#
+# _SUMMARY_ACTION_CARD = {
+#     "schema": "2.0",
+#     "config": {"update_multi": True},
+#     "header": {
+#         "title": {"tag": "plain_text", "content": "周报总结已生成"},
+#         "template": "green",
+#     },
+#     "body": {
+#         "elements": [
+#             {
+#                 "tag": "markdown",
+#                 "content": "请选择下一步操作。如需按特定风格改写，在下方输入要求后点击「重新改写」。",
+#             },
+#             {"tag": "hr"},
+#             {
+#                 "tag": "form",
+#                 "name": "rewrite_form",
+#                 "elements": [
+#                     {
+#                         "tag": "input",
+#                         "name": "style_input",
+#                         "placeholder": {"tag": "plain_text", "content": "改写风格要求（可选）：如「更简洁」、「突出结果」、「偏向老板汇报风格」"},
+#                     },
+#                     {
+#                         "tag": "button",
+#                         "text": {"tag": "plain_text", "content": "重新改写"},
+#                         "type": "default",
+#                         "width": "fill",
+#                         "form_action_type": "submit",
+#                         "behaviors": [{"type": "callback", "value": {"action": "rewrite_summary"}}],
+#                     },
+#                 ],
+#             },
+#             {"tag": "hr"},
+#             {
+#                 "tag": "button",
+#                 "text": {"tag": "plain_text", "content": "写入文档 →"},
+#                 "type": "primary",
+#                 "width": "fill",
+#                 "behaviors": [{"type": "callback", "value": {"action": "submit_summary"}}],
+#             },
+#         ]
+#     },
+# }
 
 
 # ── Command list strings ─────────────────────────────────────────────────────

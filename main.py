@@ -34,6 +34,10 @@ from .services.bitable import BitableService
 from .services.contact import ContactService
 from .utils.env_config import dump_dept_bindings
 
+# todo：add 支持配置“个人风格特征词”，让输出结果尽可能模仿管理者的撰写口吻。function
+# todo: update commands for user & manager's better workflow e.g. start with user_view/manager_view card
+# todo: completely formulate, strucutre the code, delete redundent files/ unused functions and add more comments
+# todo: action view_doc send user straight to department weekly report folder
 
 @register("helloworld", "YourName", "一个简单的 Hello World 插件", "1.0.0")
 class MyPlugin(Star):
@@ -70,6 +74,7 @@ class MyPlugin(Star):
             rewrite=self._rewrite_pipeline,
             submit=self._submit_pipeline,
         )
+        self.card_service.set_reminder_pipeline(self._reminder_pipeline)
 
 #==============================================================
 #                         Card Commands
@@ -112,9 +117,38 @@ class MyPlugin(Star):
         if not isinstance(event, LarkMessageEvent):
             yield event.plain_result("This command is only abled on Lark/Feishu")
             return
-        
+
         await self.card_service.send_wrsbot_welcome(event.get_sender_id())
         event._has_send_oper = True
+
+    @filter.command("文件夹配置")
+    async def cmd_folder_config(self, event: AstrMessageEvent):
+        """检查当前用户的部门文件夹绑定状态，发送对应的反馈卡片。
+
+        - 全部部门已绑定 → send_binding_success_card
+        - 否则（含非管理员、未绑定、部分未绑定）→ send_not_binding_card
+        """
+        from astrbot.core.platform.sources.lark.lark_event import LarkMessageEvent
+
+        if not isinstance(event, LarkMessageEvent):
+            yield event.plain_result("此命令仅支持飞书平台。")
+            return
+
+        open_id = event.get_sender_id()
+        if self.card_service.is_fully_bound(open_id):
+            await self.card_service.send_binding_success_card(open_id)
+        else:
+            await self.card_service.send_not_binding_card(open_id)
+        event._has_send_oper = True
+
+    @filter.command("清除所有绑定")
+    async def cmd_clear_all_bindings(self, event: AstrMessageEvent):
+        """清除 .env 中所有 DEPT_FOLDER_* 文件夹绑定（仅用于开发测试）。"""
+        from .utils.env_config import clear_all_dept_bindings
+
+        n = clear_all_dept_bindings()
+        logger.warning(f"[Bindings] 已清除 {n} 条 DEPT_FOLDER_* 绑定 (sender={event.get_sender_id()})")
+        yield event.plain_result(f"✅ 已清除 {n} 条文件夹绑定。")
 
 #==============================================================
 #                      General Commands
@@ -537,16 +571,21 @@ class MyPlugin(Star):
                     }
 
             if not weekly_file:
-                weekly_file = await self.drive_service.find_this_week_file(folder_token)
+                weekly_file = await self.drive_service.find_this_week_file(
+                    folder_token, llm_fn=self._make_drive_llm_fn(open_id)
+                )
 
-            if not weekly_file:
-                logger.warning(f"[UserView] 未找到本周文件: folder={folder_token}")
-                return
+                if not weekly_file:
+                    logger.warning(f"[UserView] 未找到本周文件: folder={folder_token}")
+                    return
 
-            if not self.bitable_service:
+            if weekly_file.get("type") == "bitable" and not self.bitable_service:
+                logger.warning("[UserView] bitable_service 不存在，无法处理多维表格")
                 return
+        
             provider = self.context.get_using_provider(umo=f"lark:open_id:{open_id}")
             if not provider:
+                logger.warning(f"[UserView] 未找到 LLM provider: open_id={open_id}")
                 return
 
             result = await check_submissions(
@@ -580,7 +619,10 @@ class MyPlugin(Star):
         if not self.lark_api:
             return
         from .utils.env_config import get_dept_folder_token
-        from .services.report import summarize_reports, rewrite_summary
+        from .services.report import (
+            generate_report_stream,
+            check_submissions,
+        )
         from datetime import datetime, timedelta
 
         try:
@@ -599,7 +641,7 @@ class MyPlugin(Star):
                 return
 
             # ── Find this week's file ─────────────────────────────────────────
-            weekly_file = await self._find_weekly_source(folder_token)
+            weekly_file = await self._find_weekly_source(folder_token, open_id)
             if not weekly_file:
                 logger.warning(f"[Generate] 未找到本周文件: folder={folder_token}")
                 return
@@ -628,23 +670,71 @@ class MyPlugin(Star):
                 logger.warning("[Generate] 文件内容为空，无法生成总结")
                 return
 
-            # ── LLM summarize → rewrite ───────────────────────────────────────
+            # ── Submission status (so the LLM can flag missing members) ──────
+            # Manager can trigger generation even if not everyone submitted —
+            # we pass the dept's submitted / not_submitted lists to both passes
+            # so the model prepends a 「说明」 section when applicable.
+            submitted: list[str] = []
+            not_submitted: list[str] = []
+            try:
+                check_result = await check_submissions(
+                    weekly_file=weekly_file,
+                    sender_id=open_id,
+                    contact_service=self.contact_service,
+                    doc_service=self.doc_service,
+                    bitable_service=self.bitable_service,
+                    llm_provider=provider,
+                    session_id=f"wrsbot_gen_check:{open_id}",
+                )
+                if check_result.get("ok"):
+                    submitted     = check_result.get("submitted", [])
+                    not_submitted = check_result.get("not_submitted", [])
+                    logger.info(
+                        f"[Generate] 提交情况: {len(submitted)}/{check_result.get('total', 0)} "
+                        f"未提交={not_submitted}"
+                    )
+                else:
+                    logger.warning(f"[Generate] 提交检查未成功: {check_result.get('error')}")
+            except Exception as e:
+                logger.warning(f"[Generate] 提交检查异常（继续生成）: {e}")
+
+            # ── LLM generate (single pass, streamed into one CardKit card) ───
+            # Combined fact-extraction + executive-style write in one LLM call.
+            # Replaces the previous summarize → rewrite two-card flow that
+            # produced near-identical 草稿 / 总结 cards on most inputs.
             session_id = f"wrsbot_generate:{open_id}"
-            draft = await summarize_reports(content, dept_name, iso_tag, provider, session_id)
-            final = await rewrite_summary(draft, provider, session_id)
+            final = await self._stream_to_card(
+                open_id,
+                generate_report_stream(
+                    content, dept_name, iso_tag, provider, session_id,
+                    submitted=submitted, not_submitted=not_submitted,
+                ),
+                header_title=f"{dept_name} · {iso_tag} · 周报总结",
+                fallback_subtitle="周报总结",
+            )
 
             # ── Persist draft ─────────────────────────────────────────────────
+            # Keep not_submitted alongside the draft so the rewrite pipeline
+            # can pass it back to the LLM to preserve the 「说明」 section.
             await sp.put_async(
                 scope="global", scope_id="wrsbot",
                 key=f"draft:{open_id}",
-                value={"text": final, "weekly_file": weekly_file, "dept_name": dept_name, "iso_week": iso_tag},
+                value={
+                    "text":          final,
+                    "weekly_file":   weekly_file,
+                    "dept_name":     dept_name,
+                    "iso_week":      iso_tag,
+                    "not_submitted": not_submitted,
+                },
             )
 
-            # ── Deliver ───────────────────────────────────────────────────────
+            # ── Deliver action card ───────────────────────────────────────────
+            # Patch the in-place generating card → action card (rewrite/submit).
+            # Fall back to a DM only if there's no message_id to patch.
             if message_id:
                 await self.card_service.send_generated_success_card(message_id)
-            await self.card_service.send_report_content_card(open_id, final, dept_name, iso_tag)
-            await self.card_service.send_summary_action_card(open_id)
+            else:
+                await self.card_service.send_summary_action_card(open_id)
             logger.info(f"[Generate] 周报总结生成完成: dept={dept_name}")
 
         except Exception as e:
@@ -654,7 +744,9 @@ class MyPlugin(Star):
         """Rewrite the stored draft with optional style instructions, then resend."""
         if not self.lark_api:
             return
-        from .services.report import rewrite_summary
+        from .services.report import rewrite_summary_stream
+
+        logger.warning(f"[Rewrite] pipeline start open_id={open_id} style_input={style_input!r}")
 
         try:
             stored = await sp.get_async(
@@ -668,10 +760,19 @@ class MyPlugin(Star):
             if not provider:
                 return
 
-            final = await rewrite_summary(
-                stored["text"], provider,
-                session_id=f"wrsbot_rewrite:{open_id}",
-                style_input=style_input,
+            dept_name     = stored.get("dept_name", "")
+            iso_week      = stored.get("iso_week", "")
+            not_submitted = stored.get("not_submitted", []) or []
+            final = await self._stream_to_card(
+                open_id,
+                rewrite_summary_stream(
+                    stored["text"], provider,
+                    session_id=f"wrsbot_rewrite:{open_id}",
+                    style_input=style_input,
+                    not_submitted=not_submitted,
+                ),
+                header_title=f"{dept_name} · {iso_week} · 周报总结",
+                fallback_subtitle="周报总结",
             )
 
             await sp.put_async(
@@ -680,15 +781,130 @@ class MyPlugin(Star):
                 value={**stored, "text": final},
             )
 
-            await self.card_service.send_report_content_card(
-                open_id, final,
-                stored.get("dept_name", ""), stored.get("iso_week", ""),
-            )
             await self.card_service.send_summary_action_card(open_id)
             logger.info(f"[Rewrite] 改写完成: open_id={open_id}")
 
         except Exception as e:
             logger.error(f"[Rewrite] 改写失败: {e}")
+
+    async def _stream_to_card(
+        self,
+        open_id: str,
+        text_stream,
+        header_title: str = "",
+        fallback_subtitle: str = "",
+    ) -> str:
+        """Drive a cumulative-text async generator into a Feishu streaming card.
+
+        text_stream yields full snapshots (not deltas) — the CardKit content
+        endpoint expects the full accumulated text each tick. A decoupled
+        sender loop pushes whenever the snapshot changes; RTT acts as natural
+        rate-limiting so we don't hammer the API per token.
+
+        Falls back to a plain Feishu post message if CardKit is unavailable
+        or card delivery fails, so the user always receives the report.
+
+        Returns the final accumulated text.
+
+        Note: AstrBot ships LarkMessageEvent.send_streaming with similar
+        decoupled-sender logic, but it's instance-bound (needs message_obj,
+        platform_meta, reply context) and expects a MessageChain generator.
+        Our card-callback pipeline has none of those, so we own the loop.
+        See services/lark_card.py CardKit helpers for the full rationale.
+        """
+        import asyncio
+
+        # Try CardKit first
+        card_id = await self.card_service.create_streaming_card(header_title)
+        sent = False
+        if card_id:
+            sent = await self.card_service.send_streaming_card_to_user(open_id, card_id)
+
+        if not card_id or not sent:
+            # Fallback: buffer everything, send as one post message at the end
+            logger.warning("[Stream] CardKit 不可用，回退为普通 post 消息")
+            final = ""
+            async for snapshot in text_stream:
+                final = snapshot
+            if final:
+                await self._send_report_message(open_id, final, dept_name=fallback_subtitle)
+            return final
+
+        snapshot = ""
+        last_sent = ""
+        sequence = 0
+        done = False
+        changed = asyncio.Event()
+
+        async def sender_loop() -> None:
+            nonlocal sequence, last_sent
+            while not done:
+                await changed.wait()
+                changed.clear()
+                current = snapshot
+                if current and current != last_sent:
+                    sequence += 1
+                    ok = await self.card_service.update_streaming_text(card_id, current, sequence)
+                    if ok:
+                        last_sent = current
+                    if snapshot != current:
+                        changed.set()
+
+        sender_task = asyncio.create_task(sender_loop())
+
+        try:
+            async for snap in text_stream:
+                snapshot = snap
+                changed.set()
+        finally:
+            done = True
+            changed.set()
+            try:
+                await sender_task
+            except Exception as e:
+                logger.warning(f"[Stream] sender_loop 异常: {e}")
+
+            # Final flush — make sure the closing snapshot is delivered
+            if snapshot and snapshot != last_sent:
+                sequence += 1
+                await self.card_service.update_streaming_text(card_id, snapshot, sequence)
+            sequence += 1
+            await self.card_service.close_streaming_card(card_id, sequence)
+
+        return snapshot
+
+    async def _send_report_message(
+        self,
+        open_id: str,
+        report_text: str,
+        dept_name: str = "",
+        iso_week: str = "",
+    ) -> None:
+        """Send the LLM-generated report as a Feishu post message.
+
+        Uses msg_type="post" with a single `md` segment so the markdown
+        (headers, bullets, bold) renders natively — the same path AstrBot
+        uses for normal LLM replies. dept_name + iso_week become the post
+        title for context, separate from the model output.
+        """
+        if not self.lark_api:
+            return
+        from astrbot.core.platform.sources.lark.lark_event import LarkMessageEvent
+
+        title = " · ".join(p for p in (dept_name, iso_week, "周报总结") if p)
+        content = {
+            "zh_cn": {
+                "title": title,
+                "content": [[{"tag": "md", "text": report_text}]],
+            }
+        }
+        await LarkMessageEvent._send_im_message(
+            self.lark_api,
+            content=json.dumps(content, ensure_ascii=False),
+            msg_type="post",
+            receive_id=open_id,
+            receive_id_type="open_id",
+        )
 
     async def _submit_pipeline(self, open_id: str) -> None:
         """Write the stored draft to bitable 部门总结 row."""
@@ -709,27 +925,79 @@ class MyPlugin(Star):
             final_text  = stored.get("text", "")
             dept_name   = stored.get("dept_name", "")
 
-            if not self.bitable_service:
-                return
+            file_type = weekly_file.get("type", "")
+            target_desc = ""  # filled below for the success DM
 
-            if weekly_file.get("type") == "bitable":
+            if file_type == "bitable":
+                if not self.bitable_service:
+                    logger.warning("[Submit] bitable_service 未就绪")
+                    return
+                from .services.report import split_report_to_columns, _md_to_plain
+
                 app_token = weekly_file["token"]
                 table_id  = weekly_file.get("table_id", "")
+
+                # ── Discover the table's column schema ──────────────────────
+                column_names: list[str] = []
+                try:
+                    fields = await self.bitable_service.list_fields(app_token, table_id)
+                    column_names = [f["field_name"] for f in fields if f.get("field_name")]
+                    logger.info(f"[Submit] 表格列: {column_names}")
+                except Exception as e:
+                    logger.warning(f"[Submit] 读取列定义失败（继续单列写入）: {e}")
+
+                # ── Ask the LLM to map sections → columns ───────────────────
+                fields_map: dict[str, str] = {}
+                provider = self.context.get_using_provider(umo=f"lark:open_id:{open_id}")
+                if column_names and provider:
+                    fields_map = await split_report_to_columns(
+                        final_text, column_names, provider,
+                        session_id=f"wrsbot_split:{open_id}",
+                    )
+                    logger.info(f"[Submit] LLM 列分配: {list(fields_map.keys())}")
+
+                # Fallback when split failed: dump cleaned text into 本周进展.
+                if not fields_map:
+                    fields_map = {"本周进展": _md_to_plain(final_text)}
+
+                # Always anchor the row with 姓名 = 部门总结 so find_summary_record
+                # picks it up next time.
+                fields_map["姓名"] = "部门总结"
+
                 record_id = await self.bitable_service.find_summary_record(app_token, table_id)
-                if not record_id:
-                    logger.warning("[Submit] 未找到部门总结行，无法写入")
+                if record_id:
+                    await self.bitable_service.update_record(
+                        app_token, table_id, record_id, fields_map
+                    )
+                else:
+                    record_id = await self.bitable_service.create_record(
+                        app_token, table_id, fields_map,
+                    )
+                    logger.info(f"[Submit] 已创建部门总结行: record_id={record_id}")
+                target_desc = "本周多维表格「部门总结」行"
+
+            elif file_type in ("docx", "doc"):
+                if not self.doc_service:
+                    logger.warning("[Submit] doc_service 未就绪")
                     return
-                await self.bitable_service.update_record(
-                    app_token, table_id, record_id, {"本周进展": final_text}
-                )
+                # Prepend a heading so the appended section is visually anchored
+                # at the doc's tail. Re-submitting will append another section —
+                # caller is responsible for any dedupe.
+                doc_id = weekly_file["token"]
+                heading = f"#### 部门总结（{dept_name}）" if dept_name else "#### 部门总结"
+                report_with_heading = f"{heading}\n{final_text}"
+                n_blocks = await self.doc_service.append_report(doc_id, report_with_heading)
+                logger.info(f"[Submit] 已追加 {n_blocks} 个块到 Doc: doc_id={doc_id}")
+                target_desc = "本周飞书文档末尾"
+
             else:
-                logger.warning("[Submit] Doc 写入暂未实现")
+                logger.warning(f"[Submit] 不支持的文件类型: {file_type!r}")
                 return
 
             await LarkMessageEvent._send_im_message(
                 self.lark_api,
                 content=json.dumps(
-                    {"text": f"✅ 周报总结已写入【{dept_name}】本周多维表格「部门总结」行。"},
+                    {"text": f"✅ 周报总结已写入【{dept_name}】{target_desc}。"},
                     ensure_ascii=False,
                 ),
                 msg_type="text",
@@ -741,8 +1009,13 @@ class MyPlugin(Star):
         except Exception as e:
             logger.error(f"[Submit] 写入失败: {e}")
 
-    async def _find_weekly_source(self, folder_token: str) -> "dict | None":
-        """Shared helper — bitable table-match first, doc name-match second."""
+    async def _find_weekly_source(self, folder_token: str, open_id: str = "") -> "dict | None":
+        """Shared helper — bitable table-match first, doc name-match (with LLM fallback) second.
+
+        open_id: when provided, the drive fallback uses an LLM picker to
+        disambiguate filenames that don't match the ISO-week / date-range
+        regex patterns (e.g. "2026周报week21" wouldn't match the rules).
+        """
         from datetime import datetime, timedelta
         today  = datetime.now().date()
         monday = today - timedelta(days=today.weekday())
@@ -762,7 +1035,39 @@ class MyPlugin(Star):
                     "table_name": matched["name"],
                 }
 
-        return await self.drive_service.find_this_week_file(folder_token)
+        llm_fn = self._make_drive_llm_fn(open_id) if open_id else None
+        return await self.drive_service.find_this_week_file(folder_token, llm_fn=llm_fn)
+
+    def _make_drive_llm_fn(self, open_id: str):
+        """Return an async callable for drive.find_this_week_file's llm_fn.
+
+        Picks the most-likely-current-week file from a name list using the
+        user's configured LLM provider. Mirrors _WeeklyFileTestRunner._make_llm_fn
+        but bound to open_id since card-callback pipelines have no event context.
+        """
+        async def _llm_pick(names: list[str]) -> str | None:
+            from datetime import datetime as _dt
+            today = _dt.now()
+            _, week, _ = today.isocalendar()
+            umo = f"lark:open_id:{open_id}"
+            provider = self.context.get_using_provider(umo=umo)
+            if not provider:
+                return None
+            prompt = (
+                f"今天是 {today.strftime('%Y-%m-%d')}（第 {week} 周）。"
+                f"以下是飞书文件夹中的文件名列表：\n"
+                + "\n".join(f"- {n}" for n in names)
+                + "\n\n哪个文件最可能是本周的周报？请只回复文件名，不要添加其他内容。如果都不像，请回复 none。"
+            )
+            try:
+                resp = await provider.text_chat(prompt=prompt, session_id=umo)
+            except Exception as e:
+                logger.warning(f"[Drive LLM] 调用失败: {e}")
+                return None
+            chosen = resp.completion_text.strip().strip('"').strip("'")
+            return chosen if chosen.lower() != "none" else None
+
+        return _llm_pick
 
     async def _admin_view_pipeline(self, open_id: str, message_id: str = "") -> None:
         """Async pipeline triggered by wrsbot_start card action for admin users.
@@ -812,16 +1117,23 @@ class MyPlugin(Star):
                     }
 
             if not weekly_file:
-                weekly_file = await self.drive_service.find_this_week_file(folder_token)
+                weekly_file = await self.drive_service.find_this_week_file(
+                    folder_token, llm_fn=self._make_drive_llm_fn(open_id)
+                )
 
-            if not weekly_file:
-                logger.warning(f"[AdminView] 未找到本周文件: folder={folder_token}")
-                return
+                if not weekly_file:
+                    logger.warning(f"[AdminView] 未找到本周文件: folder={folder_token}")
+                    return
 
             # ── Submission check ─────────────────────────────────────────────
-            if not self.bitable_service:
+            if weekly_file.get("type") == "bitable" and not self.bitable_service:
+                logger.warning("[UserView] bitable_service 不存在，无法处理多维表格")
                 return
+        
             provider = self.context.get_using_provider(umo=f"lark:open_id:{open_id}")
+            if not provider:
+                logger.warning(f"[UserView] 未找到 LLM provider: open_id={open_id}")
+                return
             if not provider:
                 logger.warning(f"[AdminView] 无可用 LLM 提供者")
                 return
@@ -844,6 +1156,103 @@ class MyPlugin(Star):
 
         except Exception as e:
             logger.error(f"[AdminView] 管理员视图加载失败: {e}")
+
+    async def _reminder_pipeline(self, open_id: str) -> None:
+        """DM the user_view_card to every member who hasn't submitted yet.
+
+        Mirrors the discovery half of _admin_view_pipeline (folder → weekly
+        file → submission check), then fans out user_view_card sends to each
+        name in not_submitted. Names are mapped to open_ids via the members
+        list returned by check_submissions.
+        """
+        from .services.report import check_submissions
+        from .utils.env_config import get_dept_folder_token
+        from datetime import datetime, timedelta
+
+        try:
+            org_tree = await self.contact_service.get_cached_org_tree()
+            managed = [
+                e for e in org_tree
+                if e.get("manager") and e["manager"].open_id == open_id
+            ]
+            if not managed:
+                logger.warning(f"[Reminder] 未找到管理的部门: open_id={open_id}")
+                return
+
+            dept = managed[0]["dept"]
+            dept_name = dept.name or ""
+            open_dept_id = getattr(dept, "open_department_id", "") or ""
+            folder_token = get_dept_folder_token(open_dept_id)
+            if not folder_token:
+                logger.warning(f"[Reminder] 文件夹未绑定: dept={dept_name}")
+                return
+
+            # ── Find this week's file/table (same flow as admin pipeline) ────
+            files = await self.drive_service.list_folder_files(folder_token)
+            weekly_file: dict | None = None
+
+            bitable_files = [f for f in files if f["type"] == "bitable"]
+            if bitable_files and self.bitable_service:
+                today = datetime.now().date()
+                monday = today - timedelta(days=today.weekday())
+                year, week, _ = monday.isocalendar()
+                iso_tag = f"{year}-W{week:02d}"
+                tables = await self.bitable_service.list_tables(bitable_files[0]["token"])
+                matched = next((t for t in tables if iso_tag in t["name"]), None)
+                if matched:
+                    weekly_file = {
+                        **bitable_files[0],
+                        "table_id":   matched["table_id"],
+                        "table_name": matched["name"],
+                    }
+
+            if not weekly_file:
+                weekly_file = await self.drive_service.find_this_week_file(
+                    folder_token, llm_fn=self._make_drive_llm_fn(open_id)
+                )
+                if not weekly_file:
+                    logger.warning(f"[Reminder] 未找到本周文件: folder={folder_token}")
+                    return
+
+            provider = self.context.get_using_provider(umo=f"lark:open_id:{open_id}")
+            if not provider:
+                logger.warning(f"[Reminder] 未找到 LLM provider: open_id={open_id}")
+                return
+
+            result = await check_submissions(
+                weekly_file=weekly_file,
+                sender_id=open_id,
+                contact_service=self.contact_service,
+                doc_service=self.doc_service,
+                bitable_service=self.bitable_service,
+                llm_provider=provider,
+                session_id=f"wrsbot_reminder:{open_id}",
+            )
+
+            if not result["ok"]:
+                logger.warning(f"[Reminder] 提交检查失败: {result['error']}")
+                return
+
+            not_submitted = set(result.get("not_submitted", []))
+            if not not_submitted:
+                logger.info(f"[Reminder] 全员已提交，无需提醒: dept={dept_name}")
+                return
+
+            # Map names → open_ids via the members list (check_submissions only
+            # returns names in submitted/not_submitted; open_ids live in members).
+            sent = 0
+            for m in result.get("members", []):
+                if m.get("name") in not_submitted and m.get("open_id"):
+                    await self.card_service.send_user_view_card(
+                        m["open_id"], dept_name, is_submitted=False
+                    )
+                    sent += 1
+            logger.info(
+                f"[Reminder] dept={dept_name} 已发送 {sent}/{len(not_submitted)} 张提醒卡片"
+            )
+
+        except Exception as e:
+            logger.error(f"[Reminder] 提交提醒失败: {e}")
 
     @filter.command("test_feishu_doc")
     async def test_feishu_doc(self, event: AstrMessageEvent):

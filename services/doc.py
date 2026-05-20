@@ -20,8 +20,19 @@
 #    and domain-specific abstractions on top.
 #=====================================================
 
-from lark_oapi.api.docx.v1 import RawContentDocumentRequest, ListDocumentBlockRequest
+import re
+
+from lark_oapi.api.docx.v1 import (
+    RawContentDocumentRequest,
+    ListDocumentBlockRequest,
+    CreateDocumentBlockChildrenRequest,
+    CreateDocumentBlockChildrenRequestBody,
+    GetDocumentBlockRequest,
+    Block,
+)
 from lark_oapi.api.drive.v1 import ListFileRequest
+from lark_oapi.core.json import JSON as _LarkJSON
+from astrbot.api import logger
 
 
 class DocService:
@@ -96,6 +107,115 @@ class DocService:
         """Create a new doc in the folder and write content blocks into it. Returns doc URL."""
         raise NotImplementedError
 
+    # ── Writing ──────────────────────────────────────────────────────────────
+
+    async def append_report(self, doc_id: str, markdown_text: str) -> int:
+        """Append a generated report (markdown-ish) to the end of a Feishu Doc.
+
+        Parses the LLM's #### / `- ` / paragraph output into Feishu block dicts
+        and inserts them as children of the document root. Returns the number
+        of blocks appended.
+
+        index handling: docx v1's CreateDocumentBlockChildren rejects index=-1
+        with `1770001 invalid param`. We fetch the root block's current
+        children count and use that as the index (always a valid positive
+        position that lands at the tail).
+
+        Caller is responsible for any "dedupe with previous 部门总结 section"
+        logic — this method only appends; it does not delete existing content.
+        """
+        blocks = _markdown_to_block_dicts(markdown_text)
+        if not blocks:
+            return 0
+
+        # In docx v1, the document root block_id equals the document_id.
+        append_index = await self._get_root_children_count(doc_id)
+
+        body = (
+            CreateDocumentBlockChildrenRequestBody.builder()
+            .children([Block(b) for b in blocks])
+            .index(append_index)
+            .build()
+        )
+        # Diagnostic: dump exactly what Feishu will receive, so 1770001 errors
+        # can be inspected. The Encoder filters None fields, so this is the
+        # post-serialization body.
+        try:
+            body_json = _LarkJSON.marshal(body)
+            #Debug logger. Disabled when not used
+            #logger.warning(
+            #    f"[Doc] append_report request body (len={len(body_json or '')}): {body_json}"
+            #)
+            logger.debug
+        except Exception as e:
+            logger.warning(f"[Doc] body 序列化预览失败: {e}")
+
+        req = (
+            CreateDocumentBlockChildrenRequest.builder()
+            .document_id(doc_id)
+            .block_id(doc_id)
+            .document_revision_id(-1)  # -1 = latest revision
+            .request_body(body)
+            .build()
+        )
+        resp = await self.lark_api.docx.v1.document_block_children.acreate(req)
+        if not resp.success():
+            # Surface every diagnostic Feishu hands back.
+            violation_details = ""
+            err = getattr(resp, "error", None)
+            if err is not None:
+                fvs = getattr(err, "field_violations", None) or []
+                if fvs:
+                    violation_details = " field_violations=" + "; ".join(
+                        f"{getattr(fv, 'field', '?')}={getattr(fv, 'value', '?')!r}: {getattr(fv, 'description', '?')}"
+                        for fv in fvs
+                    )
+                log_id = getattr(err, "log_id", None)
+                if log_id:
+                    violation_details += f" log_id={log_id}"
+            # Dump the raw HTTP response body — sometimes contains an `ext`
+            # field or detailed reason the SDK doesn't expose via .error.
+            raw_body = ""
+            raw = getattr(resp, "raw", None)
+            if raw is not None and raw.content:
+                try:
+                    raw_body = " raw=" + raw.content.decode("utf-8", errors="replace")
+                except Exception:
+                    raw_body = f" raw=<{len(raw.content)} bytes, decode failed>"
+            raise RuntimeError(
+                f"[Doc] append_report 失败: code={resp.code} msg={resp.msg} "
+                f"doc_id={doc_id} index={append_index} n_blocks={len(blocks)}"
+                f"{violation_details}{raw_body}"
+            )
+        logger.debug(
+            f"[Doc] append_report: doc={doc_id} index={append_index} blocks={len(blocks)}"
+        )
+        return len(blocks)
+
+    async def _get_root_children_count(self, doc_id: str) -> int:
+        """Return the number of direct children of the doc's root block.
+
+        Used as the `index` for appending children at the end. Falls back to
+        0 (prepend) if the call fails, so submission never hard-errors here.
+        """
+        req = (
+            GetDocumentBlockRequest.builder()
+            .document_id(doc_id)
+            .block_id(doc_id)
+            .build()
+        )
+        try:
+            resp = await self.lark_api.docx.v1.document_block.aget(req)
+        except Exception as e:
+            logger.warning(f"[Doc] 获取根块异常，回退 index=0: {e}")
+            return 0
+        if not resp.success() or resp.data is None or resp.data.block is None:
+            logger.warning(
+                f"[Doc] 获取根块失败({resp.code}): {resp.msg}; 回退 index=0"
+            )
+            return 0
+        return len(resp.data.block.children or [])
+
 
 # ── Block rendering helpers ──────────────────────────────────────────────────
 # Module-level so they don't clutter the class and are independently testable.
@@ -112,14 +232,18 @@ _HEADING_PREFIX: dict[int, str] = {
 }
 
 _INLINE_PREFIX: dict[int, str] = {
-    9:  "- ",   # bullet (unordered list)
-    10: "1. ",  # ordered list (all rendered as "1." — LLM understands sequence)
-    12: "> ",   # quote / callout
-    13: "☐ ",  # todo / checkbox
+    12: "- ",   # bullet (unordered list)
+    13: "1. ",  # ordered list (all rendered as "1." — LLM understands sequence)
+    15: "> ",   # quote / callout
+    17: "☐ ",  # todo / checkbox
 }
 
 # block_type → attribute name on the Block object that holds the text content.
 # These mirror the JSON field names in the Feishu API response.
+# IMPORTANT: Feishu docx v1's block_type integers go heading1..9 (3..11), THEN
+# bullet=12, ordered=13, code=14, quote=15, todo=17. An earlier version of this
+# map had 9='bullet' which collides with heading7 and caused 1770001 invalid
+# param on every doc write — keep this aligned with Feishu's official enum.
 _TYPE_ATTR: dict[int, str] = {
     2:  "text",
     3:  "heading1",
@@ -128,11 +252,14 @@ _TYPE_ATTR: dict[int, str] = {
     6:  "heading4",
     7:  "heading5",
     8:  "heading6",
-    9:  "bullet",
-    10: "ordered",
-    11: "code",
-    12: "quote",
-    13: "todo",
+    9:  "heading7",
+    10: "heading8",
+    11: "heading9",
+    12: "bullet",
+    13: "ordered",
+    14: "code",
+    15: "quote",
+    17: "todo",
 }
 
 
@@ -159,6 +286,74 @@ def _extract_block_text(block) -> str:
     return "".join(parts)
 
 
+# Inverse of _TYPE_ATTR — for emitting blocks from markdown-ish text.
+# Maps "what we want to render" to (block_type, attr_name) for the API body.
+_HEADING_LEVEL_TO_BLOCK: dict[int, tuple[int, str]] = {
+    1: (3, "heading1"),
+    2: (4, "heading2"),
+    3: (5, "heading3"),
+    4: (6, "heading4"),
+    5: (7, "heading5"),
+    6: (8, "heading6"),
+}
+
+_HEADING_LINE_RE = re.compile(r"^(#{1,6})\s+(.+)$")
+_BULLET_LINE_RE  = re.compile(r"^[-*]\s+(.+)$")
+
+
+def _make_block_dict(block_type: int, attr_name: str, content: str) -> dict:
+    """Build a Feishu doc block dict for a single inline-text element.
+
+    Includes empty `style: {}` on the Text container and `text_element_style: {}`
+    on the TextRun. Both are documented as optional, but some Feishu docx v1
+    deployments reject blocks without them with 1770001 invalid param.
+    """
+    return {
+        "block_type": block_type,
+        attr_name: {
+            "style": {},
+            "elements": [{
+                "text_run": {
+                    "content": content,
+                    "text_element_style": {},
+                }
+            }],
+        },
+    }
+
+
+def _markdown_to_block_dicts(text: str) -> list[dict]:
+    """Convert the LLM's markdown-ish report output to Feishu block dicts.
+
+    Supported:
+      - ``#### Heading`` (any level 1-6 → heading1..heading6)
+      - ``- bullet`` or ``* bullet`` → bullet block (block_type 9)
+      - Everything else non-blank → paragraph (block_type 2)
+    Blank lines are dropped (Feishu spaces blocks automatically).
+    """
+    blocks: list[dict] = []
+    for line in text.splitlines():
+        s = line.strip()
+        if not s:
+            continue
+
+        h = _HEADING_LINE_RE.match(s)
+        if h:
+            level = len(h.group(1))
+            content = h.group(2).strip()
+            btype, attr = _HEADING_LEVEL_TO_BLOCK.get(level, (4, "heading2"))
+            blocks.append(_make_block_dict(btype, attr, content))
+            continue
+
+        b = _BULLET_LINE_RE.match(s)
+        if b:
+            blocks.append(_make_block_dict(12, "bullet", b.group(1).strip()))
+            continue
+
+        blocks.append(_make_block_dict(2, "text", s))
+    return blocks
+
+
 def _blocks_to_markdown(blocks: list) -> str:
     """Convert a flat list of Feishu Block objects to a markdown-like string.
 
@@ -171,7 +366,7 @@ def _blocks_to_markdown(blocks: list) -> str:
         btype = block.block_type
         if btype == 1:      # page root — container, no content
             continue
-        if btype == 14:     # divider — no text
+        if btype == 22:     # divider — no text
             lines.append("---")
             continue
 
@@ -182,10 +377,10 @@ def _blocks_to_markdown(blocks: list) -> str:
         if btype in _HEADING_PREFIX:
             lines.append("")  # blank line before each heading for section separation
             lines.append(f"{_HEADING_PREFIX[btype]}{text}")
+        elif btype == 14:   # code block — render as fenced code
+            lines.append(f"```\n{text}\n```")
         elif btype in _INLINE_PREFIX:
             lines.append(f"{_INLINE_PREFIX[btype]}{text}")
-        elif btype == 11:   # code block
-            lines.append(f"```\n{text}\n```")
         else:               # paragraph and any other text-bearing block
             lines.append(text)
 

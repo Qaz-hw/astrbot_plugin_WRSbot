@@ -21,7 +21,7 @@ import os
 import re
 from pathlib import Path
 
-from dotenv import set_key
+from dotenv import set_key, unset_key, dotenv_values
 
 _ENV_PATH = Path(__file__).parent.parent / ".env"
 _DEPT_FOLDER_PREFIX = "DEPT_FOLDER_"
@@ -54,6 +54,39 @@ def set_dept_folder_token(open_dept_id: str, token: str) -> None:
     key = _to_env_key(open_dept_id)
     set_key(_ENV_PATH, key, token)
     os.environ[key] = token
+
+
+def delete_dept_folder_token(open_dept_id: str) -> bool:
+    """Remove a single department's folder token from .env and the current process.
+
+    Returns True if a key was removed, False if it wasn't set.
+    """
+    key = _to_env_key(open_dept_id)
+    existed = key in (dotenv_values(_ENV_PATH) or {}) or key in os.environ
+    unset_key(_ENV_PATH, key)
+    os.environ.pop(key, None)
+    return existed
+
+
+def clear_all_dept_bindings() -> int:
+    """Remove every DEPT_FOLDER_* key from .env and the current process env.
+
+    Returns the number of bindings deleted. Reads from both the .env file
+    and os.environ so we catch keys that exist in only one place.
+    """
+    file_keys = {
+        k for k in (dotenv_values(_ENV_PATH) or {}).keys()
+        if k.startswith(_DEPT_FOLDER_PREFIX)
+    }
+    process_keys = {
+        k for k in list(os.environ.keys())
+        if k.startswith(_DEPT_FOLDER_PREFIX)
+    }
+    all_keys = file_keys | process_keys
+    for key in all_keys:
+        unset_key(_ENV_PATH, key)
+        os.environ.pop(key, None)
+    return len(all_keys)
 
 
 def extract_folder_token_from_url(url: str) -> str | None:
