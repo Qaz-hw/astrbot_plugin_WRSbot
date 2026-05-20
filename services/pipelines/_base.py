@@ -20,8 +20,21 @@ from astrbot.api import logger
 
 # Global LLM concurrency cap. Bounds the parallel fan-out of map-reduce
 # generate (variant 1) so we don't burst-call past provider RPM/TPM limits
-# when a manager triggers a large-dept report. Sized for one bot instance —
-# raise it if your provider tier permits more concurrent calls.
+# when a manager triggers a large-dept report.
+#
+# SCALE TARGET (current): 30–50 employees per dept, single bot instance.
+#   8 concurrent calls × ~2-4s per extract = full dept extracted in ~8-25s.
+#
+# TODO [scale > 100 employees per dept]:
+#   - Raise to 16-32 (verify against provider tier RPM/TPM first).
+#   - Consider a per-dept queue so simultaneous Monday-morning report runs
+#     from multiple depts don't starve each other on this single shared cap.
+#   - Move to per-provider-tier semaphores if you start mixing models
+#     (e.g. Haiku for extract, Sonnet for reduce).
+# TODO [multi-bot deployment]:
+#   - This is a process-local semaphore. Horizontal scaling across multiple
+#     bot processes requires a distributed limiter (Redis token bucket) to
+#     avoid each process hammering the provider with its own cap-8 budget.
 _LLM_SEMAPHORE = asyncio.Semaphore(8)
 
 

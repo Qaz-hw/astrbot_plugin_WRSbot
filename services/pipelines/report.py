@@ -53,19 +53,37 @@ class ReportPipelines(PipelineBase):
         if not self.lark_api:
             return
         from ..report import (
-            generate_report_stream,
             generate_report_stream_mapreduce,
             check_submissions,
         )
         from ...utils.env_config import get_dept_folder_token
         from ...utils.manager_style import get_manager_style
 
-        # Switch threshold for map-reduce. Below this many bitable rows we
-        # use the single-call path (cheaper per-call overhead). At/above it
-        # we fan out to per-employee extraction (better attention focus).
-        # Doc files always use the single-call path because we can't
-        # cheaply split a doc into per-employee chunks here.
-        MAPREDUCE_THRESHOLD = 5
+        # Generate always uses the 3-stage pipeline (extract → plan → write).
+        # Both bitable and doc paths converge into generate_report_stream_mapreduce:
+        #   - bitable: each record splits into its own (name, text) tuple →
+        #     extract fans out in parallel under llm_semaphore
+        #   - doc:     single ("团队", full_doc_text) tuple → extract runs once
+        #              (the doc can't be cheaply split per-employee here)
+        # Either way the plan + write stages run identically downstream so the
+        # final report has the same project-centric structure regardless of
+        # source file type.
+        #
+        # SCALE TARGET (current): 30–50 employees per dept.
+        #
+        # TODO [scale > 100 employees per dept]:
+        #   - Add a hierarchical layer between extract and plan:
+        #         extract (per employee, parallel)
+        #           → team_rollup (per team, parallel — new function)
+        #             → plan (single call, sees team rollups not raw facts)
+        #             → write (streaming)
+        #     Needed because at 100+ employees the plan stage's JSON input
+        #     starts to dilute attention. Team-level rollup acts as a
+        #     coarsening layer; plan only sees ~5-10 team rollups instead
+        #     of 100 raw EmployeeFacts.
+        #   - Track team membership via contact_service.get_cached_org_tree
+        #     (sub-departments exist in Feishu org tree but we don't model
+        #     them yet — see services/contact.py for the cache shape).
 
         try:
             # ── Resolve folder ────────────────────────────────────────────────
@@ -103,8 +121,10 @@ class ReportPipelines(PipelineBase):
             year, week, _ = monday.isocalendar()
             iso_tag = f"{year}-W{week:02d}"
 
-            # records is populated only on the bitable path. Map-reduce reuses
-            # it to split per-employee; doc path stays on single-call generate.
+            # Read source content. For bitable we keep `records` to split per
+            # employee in the extract stage; for doc we pass a single
+            # ("团队", full_doc_text) tuple so extract still runs (just as
+            # one bigger call instead of N parallel small ones).
             records: list[dict] = []
             if weekly_file["type"] == "bitable":
                 records = await self.bitable_service.list_records(
@@ -146,46 +166,33 @@ class ReportPipelines(PipelineBase):
             except Exception as e:
                 logger.warning(f"[Generate] 提交检查异常（继续生成）: {e}")
 
-            # ── LLM generate: switch between single-call and map-reduce ──────
-            # Single-call (generate_report_stream): one LLM call sees all N
-            #   employee reports together. Cheap but attention dilutes as N grows.
-            # Map-reduce (generate_report_stream_mapreduce): N parallel small
-            #   extractions + 1 streaming synthesis. Better quality at scale,
-            #   per-employee extract calls are cache-friendly across re-runs.
-            #
-            # Threshold: bitable with >= MAPREDUCE_THRESHOLD rows → map-reduce.
-            # Doc files stay on single-call because splitting a doc into
-            # per-employee chunks would itself be an LLM call (no net win).
+            # ── 3-stage generate (extract → plan → write) ────────────────────
+            # Build the (name, text) tuples the orchestrator expects:
+            #   bitable → list of per-employee tuples (parallel extract fan-out)
+            #   doc     → single ("团队", full_doc) tuple (one extract call,
+            #             still flows through plan + write so output structure
+            #             is consistent across source types)
             session_id    = f"wrsbot_generate:{open_id}"
             style_profile = await get_manager_style(open_id)
 
-            use_mapreduce = (
-                weekly_file["type"] == "bitable"
-                and len(records) >= MAPREDUCE_THRESHOLD
-            )
-
-            if use_mapreduce:
+            if weekly_file["type"] == "bitable":
                 employee_inputs = BitableService.split_records_per_employee(records)
                 logger.info(
-                    f"[Generate] map-reduce path: N={len(employee_inputs)} "
-                    f"(threshold={MAPREDUCE_THRESHOLD})"
-                )
-                stream = generate_report_stream_mapreduce(
-                    employee_inputs, dept_name, iso_tag, provider, session_id,
-                    submitted=submitted, not_submitted=not_submitted,
-                    style_profile=style_profile,
-                    semaphore=self.llm_semaphore,
+                    f"[Generate] 3-stage path (bitable): N={len(employee_inputs)} 员工"
                 )
             else:
+                employee_inputs = [("团队", content)]
                 logger.info(
-                    f"[Generate] single-call path: type={weekly_file['type']!r} "
-                    f"records={len(records)} (threshold={MAPREDUCE_THRESHOLD})"
+                    f"[Generate] 3-stage path (doc): 整篇文档作为单源输入 "
+                    f"({len(content)} 字符)"
                 )
-                stream = generate_report_stream(
-                    content, dept_name, iso_tag, provider, session_id,
-                    submitted=submitted, not_submitted=not_submitted,
-                    style_profile=style_profile,
-                )
+
+            stream = generate_report_stream_mapreduce(
+                employee_inputs, dept_name, iso_tag, provider, session_id,
+                submitted=submitted, not_submitted=not_submitted,
+                style_profile=style_profile,
+                semaphore=self.llm_semaphore,
+            )
 
             final = await self._stream_to_card(
                 open_id,

@@ -35,8 +35,8 @@ from .services.contact import ContactService
 from .services.pipelines import ViewsPipelines, ReportPipelines, StylePipelines
 from .utils.env_config import dump_dept_bindings
 
-# TODO：added 支持配置“个人风格特征词”，让输出结果尽可能模仿管理者的撰写口吻。function.py
-# TODO: completely formulate, strucutre the code, delete redundent files/ unused functions and add more comments
+# TODO: add more comments for future dev
+# TODO: Setup persona for user and admin for things like when they are talking to the bot 
 
 @register("helloworld", "YourName", "一个简单的 Hello World 插件", "1.0.0")
 class MyPlugin(Star):
@@ -229,11 +229,16 @@ class MyPlugin(Star):
 
     @filter.command("test_llm")
     async def test_llm(self, event: AstrMessageEvent):
-        """调用 LLM 并返回回答。用法：/test_llm <问题>"""
-        prompt = event.message_str.removeprefix("/test_llm").strip()
-        persona = await self.context.persona_manager.get_default_persona_v3(umo=event.unified_msg_origin)
-        system_prompt = persona["prompt"] if persona else None
+        """[Dev] Raw LLM passthrough — does NOT apply the session persona.
 
+        Used for testing the base model's behavior without any WRSBot
+        personality or workflow prompt interfering. General chat (no command)
+        still uses the persona via AstrBot's default chat pipeline; only this
+        command bypasses it.
+
+        Usage: /test_llm <问题>
+        """
+        prompt = event.message_str.removeprefix("/test_llm").strip()
         if not prompt:
             yield event.plain_result("请在命令后输入问题，例如：/test_llm 你好")
             return
@@ -243,9 +248,10 @@ class MyPlugin(Star):
             yield event.plain_result("当前没有配置 LLM 提供者。")
             return
 
+        # Intentionally NO system_prompt — this is a raw probe of the model.
         response = await provider.text_chat(
             prompt=prompt,
-            system_prompt=system_prompt,
+            system_prompt=None,
             session_id=event.unified_msg_origin,
         )
         yield event.plain_result(response.completion_text)
@@ -371,8 +377,25 @@ class MyPlugin(Star):
 
     @filter.command("set_persona")
     async def set_persona(self, event: AstrMessageEvent):
-        """为当前会话设置人格。用法：/set_persona <人格名称>"""
-        name = event.message_str.removeprefix("/set_persona").strip()
+        """为当前会话设置人格。用法：/set_persona <人格名称>
+
+        Robust arg parsing — accepts the command with or without a leading "/"
+        and with @-mentions intact (group chat). The previous implementation
+        used `removeprefix("/set_persona")` which silently failed when the
+        user typed `set_persona X` (no slash), leaving the persona name as
+        `"set_persona X"` and producing a confusing "找不到人格" error.
+        """
+        text = event.message_str.strip()
+        # Strip Lark @-mention formats so "@bot set_persona X" parses correctly
+        text = re.sub(r"\[At:[^\]]*\]", "", text)
+        text = re.sub(r"@\S+", "", text).strip()
+        # Split on first whitespace — first token is the command name (with or
+        # without leading "/"), second token is the persona name. Anything
+        # after the second whitespace is treated as part of the name (personas
+        # typically have no spaces, but tolerate it just in case).
+        parts = text.split(None, 1)
+        name = parts[1].strip() if len(parts) > 1 else ""
+
         if not name:
             yield event.plain_result("请提供人格名称，例如：/set_persona WRSbot\n用 /test_persona 查看所有可用人格。")
             return
@@ -504,8 +527,10 @@ class MyPlugin(Star):
           • generate_summary by non-manager → silent skip (unauthorized)
           • get_writing_folder but no folder bound → reply with binding guidance
 
-        Registered BEFORE keyword_card_reply so the broader "周报" keyword
-        doesn't intercept specific intents first.
+        This is the sole "natural language → workflow" entry point. The old
+        keyword_card_reply handler (substring "周报"/"帮助" → card) was removed
+        — its routing was too brittle and called a service method that no
+        longer exists.
         """
         from astrbot.core.platform.sources.lark.lark_event import LarkMessageEvent
         if not isinstance(event, LarkMessageEvent):
@@ -591,35 +616,13 @@ class MyPlugin(Star):
             yield event.plain_result(reply)
             return
 
-    CARD_KEYWORDS = ["周报", "帮助"]
-    @filter.event_message_type(filter.EventMessageType.ALL)
-    async def keyword_card_reply(self, event: AstrMessageEvent):
-        """检测关键词，回复飞书互动卡片。"""
-        from astrbot.core.platform.sources.lark.lark_event import LarkMessageEvent
-
-        text = event.message_str.strip()
-        matched = next((kw for kw in self.CARD_KEYWORDS if kw in text), None)
-        if not matched:
-            return
-
-        if not isinstance(event, LarkMessageEvent):
-            yield event.plain_result(f"检测到关键词「{matched}」")
-            return
-
-        event.stop_event()
-
-        sender_name = event.get_sender_id()
-        try:
-            user = await self.contact_service.get_user(event.get_sender_id())
-            if user:
-                sender_name = user.name or sender_name
-        except Exception:
-            pass
-
-        await self.card_service.send_keyword_card(
-            sender_name, matched, text, event.message_obj.message_id
-        )
-        event._has_send_oper = True
+    # NOTE: the old keyword_card_reply handler ("周报" / "帮助" substring →
+    # send_keyword_card) was removed. It called a service method that no
+    # longer exists (LarkCardService.send_keyword_card) and was crashing on
+    # every message containing "周报". Its job is now handled by
+    # natural_report_trigger, which uses an LLM intent classifier instead
+    # of brittle substring matching — that's where to add new natural-
+    # language entry points.
 
 #==============================================================
 #                        Doc Commands

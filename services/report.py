@@ -32,19 +32,60 @@ from .doc import DocService
 from .contact import ContactService
 
 
-# ── Map-reduce types ──────────────────────────────────────────────────────────
-# Used by generate_report_stream_mapreduce (variant 1). Each employee's raw
-# report becomes one EmployeeFacts via extract_employee_facts; the reducer
-# consumes a list of these.
+# ── 3-stage pipeline types ────────────────────────────────────────────────────
+# Stage A (extract): per-employee → EmployeeFacts  (list[FactItem] + quality_note)
+# Stage B (plan):    EmployeeFacts[] → ReportPlan  (dedup, group by project, rank)
+# Stage C (write):   ReportPlan + style → Markdown (streamed to CardKit)
+#
+# Each FactItem carries its project_id and category, so plan stage can group
+# deterministically by project_id and let the LLM focus on dedup + ranking
+# instead of re-parsing free text.
+
+class FactItem(TypedDict):
+    """One atomic fact extracted from one employee's report.
+
+    Each bullet/line in the original report becomes ONE FactItem. The
+    extract stage is responsible for atomizing ("we did A and B" → 2 items)
+    and tagging each one with project + category.
+    """
+    category:     str   # "kpi" | "projects" | "risks" | "next_week"
+    project_id:   str   # normalized lowercase id; "_misc" if no project
+    project_name: str   # human-readable display name
+    text:         str   # the atomic fact (numbers/IDs verbatim)
+
 
 class EmployeeFacts(TypedDict):
-    """Structured facts extracted from ONE employee's weekly report."""
-    name:          str        # employee name as it appears in 通讯录 / 表格
-    kpi:           list[str]  # results, launches, closed loops, quantified outcomes
-    projects:      list[str]  # in-flight project milestones (not yet closed)
-    risks:         list[str]  # blockers, delays, quality/launch concerns
-    next_week:     list[str]  # explicit next-week actions
-    quality_note:  str        # "" if fine; short phrase if sparse/vague/off-topic
+    """Structured facts from ONE source (employee in bitable, or "团队" in doc)."""
+    name:         str             # source label — employee name or "团队"
+    items:        list[FactItem]  # flat list; plan stage will group/dedup
+    quality_note: str             # "" if fine; ≤15-char phrase if sparse/off-topic
+
+
+class ProjectRollup(TypedDict):
+    """One project's slot in the ReportPlan, post-dedup + ranking."""
+    project_id:     str       # normalized id (post any alias merging)
+    display_name:   str       # human-readable
+    importance:     int       # 1-5; only ≥2 makes it into the plan
+    owners:         list[str] # names from contributing facts
+    kpi:            list[str] # post-dedup text (verbatim facts merged)
+    projects:       list[str]
+    risks:          list[str]
+    next_week:      list[str]
+    merged_aliases: list[str] # other project_ids merged into this one
+
+
+class LowQualityMember(TypedDict):
+    name:   str
+    reason: str
+
+
+class ReportPlan(TypedDict):
+    """Complete blueprint for the write stage. Everything that ships in the
+    final report must come from this structure — write stage cannot
+    fabricate."""
+    cross_cutting_highlights: list[str]          # 1-3 top-of-report bullets
+    projects:                 list[ProjectRollup]  # sorted by importance desc
+    low_quality_members:      list[LowQualityMember]
 
 
 # ── Markdown → plain text helpers ──────────────────────────────────────────
@@ -587,33 +628,147 @@ async def generate_report_stream(
 # The reduce prompt differs from _GENERATE_SYSTEM: it explicitly tells the
 # model the input is already-extracted structured facts, so it should focus
 # on synthesis / dedup / executive-style writing, NOT re-extraction.
+#
+# ─── SCALE TARGET ───────────────────────────────────────────────────────────
+# Current design assumes 30–50 employees per dept. At this size, two stages
+# (map: per-employee extract; reduce: dept synthesis) gives good attention
+# focus + fits comfortably in single-call reducer context.
+#
+# TODO [if scale moves to 100+ employees per dept]: upgrade to a 3-stage
+#   pipeline so the reducer never sees more than ~10 inputs:
+#
+#       extract   (parallel, per employee)
+#         → ProjectRollup     (single call, JSON in / JSON out)
+#             - groups EmployeeFacts by `project_id` extracted in stage 1
+#             - dedups across employees, ranks by importance
+#             - drops noise (one-off mentions, low-quality submissions)
+#         → write             (single streaming call, JSON in / Markdown out)
+#             - facts arrive STRUCTURED so the model can't fabricate;
+#               it only reorders/rephrases what's in the rollup
+#             - style_profile (see [eager style structuring] TODO below)
+#               gets primary attention here since structure is already locked
+#
+#   New shapes to add:
+#     class ProjectRollup(TypedDict):
+#         project_id:    str   # normalized (lowercase + strip-punct)
+#         display_name:  str   # human-readable
+#         owners:        list[str]
+#         kpi:           list[str]
+#         projects:      list[str]
+#         risks:         list[str]
+#         next_week:     list[str]
+#         importance:    int   # 1-5; reducer drops project_id with imp<2
+#
+#     class ReportPlan(TypedDict):
+#         projects:                  list[ProjectRollup]
+#         cross_cutting_highlights:  list[str]   # for the top of the report
+#         low_quality_members:       list[str]   # surfaced in 「说明」 section
+#
+# TODO [eager style structuring]:
+#   Today the style profile is read per-report at generate time. At scale
+#   it should be normalized ONCE at /save_manager_style time into actuator-
+#   level dials (sentence_length, formality_int, banned_phrases,
+#   signature_phrases_from_samples) and cached. That's both cheaper and
+#   gives the writer concrete knobs instead of vague style tags that get
+#   diluted by the model's default "executive Chinese" register.
+#
+# TODO [project-centric output]:
+#   Current reducer emits 4-section structure (KPI / 项目 / 风险 / 下周).
+#   At scale, organize by project first: each project gets its own section
+#   with the 4 categories WITHIN it. Readers consume project-first; the
+#   current section-first layout forces them to mentally reassemble
+#   "what's the state of Apollo?" from scattered bullets.
 
-_EXTRACT_FACTS_SYSTEM = """你是一名周报事实提取助手。
+# ── STAGE A: extract ──────────────────────────────────────────────────────────
+# Per-employee fact extraction. ONE call sees ONE employee's report and
+# atomizes it into project-tagged FactItems. Critical work: project
+# normalization (Apollo / 阿波罗 / APL → same project_id) and category
+# assignment (kpi / projects / risks / next_week).
+#
+# Attention budget: facts ≈90%, project tagging ≈8%, quality flag ≈2%.
 
-输入：一名员工本周的原始周报。
-输出：把该员工本周的所有事实归入四个类别，输出严格 JSON。
+_EXTRACT_FACTS_SYSTEM = """你是一名周报事实结构化助手。你的工作是：把一份原始周报，逐条拆解成"原子事实"，每条事实都打上【项目标签】+【类别标签】。
 
-四个类别：
-- kpi:        已完成、已上线、已闭环、量化结果（如：完成 X，提升 Y 至 Z%）
-- projects:   仍在推进的项目里程碑（未闭环，下周或后续仍有动作）
-- risks:      当前阻塞 / 延期 / 质量或上线风险 / 跨组待对齐事项
-- next_week:  下周明确动作（不要复述本周完成项）
+────────────────────────────
+输入
+────────────────────────────
+- name: 周报作者的姓名（或团队标识）
+- raw_report: 该作者本周写的原始周报文字（可能很乱：可能混着流水账、感想、Q&A 等）
 
-提取规则：
-1. 严格保留：数字、百分比、JIRA/缺陷号、版本号、服务/模块名、日期、时间点
-2. 一条 bullet = 一个原子事实，简洁，避免"做了一些工作"这类含糊表述
-3. 如果某类别没有内容，返回空数组 []，禁止编造
-4. quality_note: 若该周报内容稀少 / 表述含糊 / 偏题，请用不超过 15 字写明；正常请留空字符串 ""
+────────────────────────────
+输出
+────────────────────────────
+严格 JSON。不要 markdown 代码块，不要任何 JSON 之外的文字。
+{
+  "items": [
+    {
+      "category":     "kpi" | "projects" | "risks" | "next_week",
+      "project_id":   "<规范化的项目 id>",
+      "project_name": "<项目显示名>",
+      "text":         "<一句话原子事实>"
+    },
+    ...
+  ],
+  "quality_note": ""   // 见下方第 5 条规则
+}
 
-仅输出 JSON，禁止任何额外文字或代码块包裹：
-{"kpi": [...], "projects": [...], "risks": [...], "next_week": [...], "quality_note": "..."}"""
+────────────────────────────
+核心规则
+────────────────────────────
+
+1. **原子化（critical）**
+   - 一条 "items" 项 = 一个独立可验证的事实。
+   - "完成 A，同时推进 B" 必须拆成 2 条。
+   - "做了一些优化" 这种聚合表述：作为 1 条保留模糊性，不要补具体内容。
+   - 流水账 / 心情 / 总结性套话（"本周整体推进顺利"）一律 **丢弃**，不进入 items。
+
+2. **项目标签（critical）**
+   - project_id 规范：纯小写英文/拼音 + 数字 + 下划线，无空格、无标点、无中文。
+       好：apollo, beacon_v2, oncall_q1
+       差：Apollo, beacon-v2, 阿波罗
+   - project_name 是人类可读的显示名（保留原文里的写法风格）。
+   - 同一项目的不同写法（"Apollo" / "阿波罗" / "APL-2026" / "阿波罗项目"）
+     必须映射到 **同一个 project_id**（如 "apollo"）。
+   - 不能归属到具体项目的事实（OKR 培训、修复内部工具 bug、参加 all-hands、
+     一次性的杂项支持等），统一用 project_id = "_misc"，project_name = "其他"。
+   - **不要为不存在的项目编造名字。** 原文模糊就用 _misc。
+
+3. **类别标签（恰好一个）**
+   - kpi: 已经完成的事，最好带量化结果。
+       "完成 X 上线，覆盖 30% 用户"  →  kpi
+       "修复 PROD-1234 缺陷"          →  kpi
+   - projects: 仍在推进、未闭环的里程碑。
+       "X 模块已完成开发，下周开始 QA"  →  projects
+       "Y 项目正在联调，预计周五出包"   →  projects
+   - risks: 当前仍影响进度的阻塞 / 跨组依赖 / 质量风险 / 上线风险。
+       "Z 监控未对齐，发布前需要 SRE 介入"   →  risks
+       "依赖 A 团队接口未交付，B 项目延期"   →  risks
+   - next_week: 明确的下周动作（**只能**来自原文里 "下周/下一步/计划" 等表述）。
+       "下周完成 X 的全量发布"           →  next_week
+       "继续推进 Y"（来自下周计划段落）  →  next_week
+
+4. **事实保真（HARD）**
+   - 数字、百分比、JIRA / 缺陷号、版本号、服务名、模块名、日期、时间点 — **逐字保留**。
+   - 不要把原文没出现的影响 / 因果 / 结论补进 text。
+   - 不要"合理化"模糊表述。原文写 "做了一些优化" 就保留 "做了一些优化"，不要扩展成 "做了性能优化"。
+   - 不要复述章节标题（不要在 text 里写 "本周完成了..."）。
+
+5. **质量标注**
+   - quality_note 留空 ""，除非原文严重缺失（< 100 字 + 无具体动作 / 完全偏题 / 与工作无关）。
+   - 非空时 ≤15 字，例：「内容仅 1 句」「未提交具体进展」「与工作无关」。
+
+6. **不做的事情**
+   - 不要排序（按原文出现顺序输出即可，后续阶段会重排）。
+   - 不要去重（同一作者内的小重复也保留，下游 plan 阶段会处理）。
+   - 不要分组（plan 阶段按 project_id 分组，你只负责打标签）。
+   - 不要润色 text 的措辞。"""
 
 
 def _build_extract_facts_prompt(name: str, raw_report: str) -> tuple[str, str]:
     user = (
-        f"员工姓名：{name}\n\n"
-        f"原始周报：\n---\n{raw_report}\n---\n\n"
-        f"请按规则提取并输出 JSON。"
+        f"name: {name}\n\n"
+        f"raw_report:\n---\n{raw_report}\n---\n\n"
+        f"请按规则输出 JSON。"
     )
     return _EXTRACT_FACTS_SYSTEM, user
 
@@ -624,30 +779,20 @@ async def extract_employee_facts(
     llm_provider,
     session_id: str,
 ) -> EmployeeFacts:
-    """[MAP] Extract structured facts from ONE employee's weekly report.
+    """[STAGE A] Atomize ONE employee's report into project-tagged FactItems.
 
-    Small focused call: the LLM sees only one person's report, so attention
-    is fully on extracting facts (no cross-employee dedup needed at this
-    stage — the reducer handles that).
+    Attention focus: facts + project tagging. No cross-employee work
+    happens here (that's stage B's job).
 
-    Args:
-        name:         employee name (used for traceability + reducer dedup)
-        raw_report:   the employee's raw weekly report text
-        llm_provider: AstrBot provider; same one used by the calling pipeline
-        session_id:   provider session tag (e.g. "wrsbot_extract:<open_id>:<name>")
-
-    Returns:
-        EmployeeFacts dict. On parse / LLM failure, returns an empty-fields
-        EmployeeFacts with quality_note populated so the reducer knows to
-        mention the failure rather than silently dropping the person.
+    On any LLM/parse failure, returns an EmployeeFacts with items=[] and
+    quality_note populated. Plan stage will surface the failure to the
+    manager via low_quality_members rather than silently dropping the
+    employee.
     """
     sys_p, usr_p = _build_extract_facts_prompt(name, raw_report)
     empty: EmployeeFacts = {
         "name":         name,
-        "kpi":          [],
-        "projects":     [],
-        "risks":        [],
-        "next_week":    [],
+        "items":        [],
         "quality_note": "",
     }
     try:
@@ -660,7 +805,6 @@ async def extract_employee_facts(
 
     raw = (resp.completion_text or "").strip()
     if raw.startswith("```"):
-        # Strip code fences if the model added them despite the instruction
         raw = raw.split("```")[1].lstrip("json").strip()
 
     try:
@@ -668,79 +812,373 @@ async def extract_employee_facts(
     except json.JSONDecodeError as e:
         logger.warning(f"[Extract][{name}] JSON 解析失败: {e} | 原始: {raw[:200]}")
         return {**empty, "quality_note": "返回格式异常"}
-
     if not isinstance(parsed, dict):
-        logger.warning(f"[Extract][{name}] LLM 返回非对象: {type(parsed).__name__}")
         return {**empty, "quality_note": "返回格式异常"}
 
-    def _as_str_list(v) -> list[str]:
-        if not isinstance(v, list):
-            return []
-        return [str(x) for x in v if x]
+    _VALID_CATEGORIES = {"kpi", "projects", "risks", "next_week"}
+    items: list[FactItem] = []
+    for raw_item in parsed.get("items", []) or []:
+        if not isinstance(raw_item, dict):
+            continue
+        cat = str(raw_item.get("category", "")).strip().lower()
+        if cat not in _VALID_CATEGORIES:
+            continue
+        text = str(raw_item.get("text", "")).strip()
+        if not text:
+            continue
+        # Normalize project_id defensively in case the model slipped on rule 2.
+        pid = str(raw_item.get("project_id", "") or "_misc").strip().lower()
+        pid = re.sub(r"[^a-z0-9_]+", "_", pid).strip("_") or "_misc"
+        pname = str(raw_item.get("project_name", "") or "").strip() or (
+            "其他" if pid == "_misc" else pid
+        )
+        items.append({
+            "category":     cat,
+            "project_id":   pid,
+            "project_name": pname,
+            "text":         text,
+        })
 
     return {
         "name":         name,
-        "kpi":          _as_str_list(parsed.get("kpi")),
-        "projects":     _as_str_list(parsed.get("projects")),
-        "risks":        _as_str_list(parsed.get("risks")),
-        "next_week":    _as_str_list(parsed.get("next_week")),
+        "items":        items,
         "quality_note": str(parsed.get("quality_note", "") or ""),
     }
 
 
-_REDUCE_SYSTEM = """你是互联网公司"部门管理周报助手"。你的任务是把多名员工已提取好的【结构化事实】，合成一份可直接发给管理层的部门周报。
+# ── STAGE B: plan ─────────────────────────────────────────────────────────────
+# Takes ALL employees' FactItems, dedups across employees, groups by project_id,
+# ranks projects by importance, picks cross-cutting highlights. Output is a
+# fully-structured ReportPlan — the write stage will not need to make any
+# structural decisions, only render this plan as markdown.
+#
+# Attention budget: dedup ≈40%, ranking ≈30%, project grouping ≈20%,
+# highlight selection ≈10%. Facts are inputs — preservation is a hard
+# constraint, not an attention cost.
 
-输入说明：
-你会收到一份事实清单，已按员工分组，每位员工的事实已按四类预先归类（kpi / projects / risks / next_week）。事实提取阶段已完成，你不需要重新解析原文。
+_PLAN_SYSTEM = """你是一名"部门周报规划官"。你的任务是把多名员工的【原子事实清单】合并、去重、按项目归类、按重要性排序，产出一份【部门周报计划】（ReportPlan）的严格 JSON。
 
-你的目标按优先级排序：
-A. 事实正确（事实清单已经标准化，逐字保留即可）
-B. 管理层一眼读懂
-C. 跨员工去重 + 重要性排序
-D. 风格统一
+────────────────────────────
+输入
+────────────────────────────
+- dept_name, iso_week: 部门 + 周次
+- employees: list[EmployeeFacts]。每个 EmployeeFacts 包含：
+    name, items (list[FactItem], 每项有 category/project_id/project_name/text), quality_note
+- not_submitted: 本周未提交周报的成员姓名
 
-硬性约束：
-1) 只使用事实清单中的内容。没有出现的事实不要补写。
-2) 数字、百分比、JIRA/缺陷号、版本号、服务/模块名、日期必须逐字保留。
-3) 跨员工去重：同一事项（同一项目名 > 同一 JIRA/版本号 > 同一目标结果 > 同一时间窗口）必须合并为一条。
-4) 同一事项不在不同章节重复堆砌：
-   - KPI 章节：写已完成 + 量化结果
-   - 项目章节：写仍在推进的里程碑
-   - 风险章节：写当前仍影响进度的阻塞
-   - 下周章节：写下周明确动作
-5) 若某事项已在 KPI 中写明"完成"，项目章节不要重复；只有仍有后续里程碑时才继续提及。
-6) 每条要点 1-2 句话，先写结果/状态，再写影响/后续。
-7) 章节内按重要性排序：线上与业务影响 > 关键项目里程碑 > 风险/延期 > 文档与内部优化。
-8) 人名默认不进入正文；只允许在「说明」段落中出现。
-9) 「说明」段落输出条件（满足任意一条即输出）：
-   - 存在 quality_note 非空的员工（列出姓名 + 原因）
-   - 用户在 user prompt 中提供了 not_submitted 名单
-   否则整段删除。
-10) 禁止空话/套话：总体来说、综上所述、首先/其次/最后、值得注意的是、稳步推进、为后续奠定基础、赋能、抓手、保驾护航。
-11) 优先词汇：完成、上线、修复、推进、联调、对齐、闭环、复盘、灰度、延期、阻塞、定稿、启动、交付、输出。
-12) 若某正式章节确无内容，用" - 无新增关键事项。"填充，不要删除章节。
-13) style_profile（若提供）只影响语气、抽象层级、压缩力度；不得改变事实、章节、排序与硬性约束。
+────────────────────────────
+输出
+────────────────────────────
+严格 JSON。不要 markdown 代码块。
+{
+  "cross_cutting_highlights": ["...", "..."],   // 本周最值得放报告顶部的 1-3 条（按重要性降序）
+  "projects": [
+    {
+      "project_id":     "apollo",
+      "display_name":   "Apollo",
+      "importance":     5,
+      "owners":         ["张三", "李四"],
+      "kpi":            ["..."],
+      "projects":       ["..."],
+      "risks":          ["..."],
+      "next_week":      ["..."],
+      "merged_aliases": []          // 其他被合并进来的 project_id
+    },
+    ...                              // 按 importance 降序
+  ],
+  "low_quality_members": [
+    {"name": "王五", "reason": "周报仅 1 句话"}
+  ]
+}
 
-输出格式（严格）：
-#### 说明
-（仅在条件 9 满足时输出，否则整段删除）
+────────────────────────────
+核心工作（按优先级）
+────────────────────────────
 
-#### 本周KPI与业务进展
-- ...
+1. **跨员工去重（critical, 40% 注意力预算）**
+   合并标准（强 → 弱）：
+   a. project_id 相同 + text 几乎相同（包含相同的项目名、JIRA、版本号、目标）
+      → 强合并：保留信息更完整的版本，丢弃其他。
+   b. project_id 相同 + 同一目标 / 同一里程碑名
+      → 中合并：把多个 text 合并为一句更完整的表述（但**只能用原文的词**）。
+   c. project_id 相同 + 时间窗口相近 + 描述相关
+      → 弱合并：如果信息不冲突就合并；如果冲突，写入 risks 一条「原始周报对 X 表述不一致」。
+   d. project_id 不同但其实是同一项目（如 "apollo" vs "apl_2026"）
+      → 把出现次数少的合并进出现次数多的 project_id，把被合并的 id 放进 merged_aliases。
 
-#### 重点项目进展
-- ...
+2. **按项目分组（critical, 20% 注意力预算）**
+   - 所有 FactItem 按 project_id 聚合到一个 ProjectRollup。
+   - 同一项目下，按原 FactItem 的 category 分到 kpi / projects / risks / next_week 四个数组。
+   - 同一项目下，KPI 里已写"完成"的事项，不再在 projects 里重复出现。
 
-#### 风险与阻塞项
-- ...
+3. **importance 评分（critical, 30% 注意力预算）**
+   评分标准：
+   - 5 = 战略级 / 线上事件 / 高层关注（核心系统上线、客户级事故、跨部门重大对齐）
+   - 4 = 多人协作的主要项目（≥3 人 涉及，或本周有明确里程碑达成）
+   - 3 = 单人推进但有实质性产出（一个独立项目的关键节点）
+   - 2 = 例行优化 / 文档 / 维护性工作 / 单条 next_week 但无 kpi
+   - 1 = 一次性提及、无后续、无具体动作 → **直接 drop，不进入输出**
+   - **_misc 项目永远归为 importance=2**（除非里面有线上事故级内容）
 
-#### 下周计划
-- ...
-"""
+4. **cross_cutting_highlights 选择（10% 注意力预算）**
+   从最终 projects 列表中，挑 1-3 条本周最值得管理层先看到的事。
+   优先级：
+   - 线上 / 业务直接影响（"X 完成全量发布，性能 +12%"）
+   - 跨多个项目的趋势（"本周 3 个项目集中进入 QA"）
+   - 重要风险（"Y 项目因依赖延迟，发布延后到下下周"）
+   严禁：单条流水账、客套话、与项目无关的事项。
+
+5. **low_quality_members 收集**
+   - 来自 quality_note 非空的员工：照搬 reason。
+   - 来自 not_submitted 名单：reason 写 "未提交"。
+
+────────────────────────────
+事实保真（HARD）
+────────────────────────────
+- kpi / projects / risks / next_week 里的每条 text，必须来自输入的 FactItem.text。
+  可以**合并 / 缩短 / 重排顺序**，但**不能新增内容、不能添加输入里没有的数字或事实**。
+- project_id 不能创造。所有 project_id 必须来自输入 FactItem.project_id（除非通过 merged_aliases 合并）。
+- next_week 不能"补建议"。原文没说要做的事，不要写进 next_week。
+- 不要在任何 text 里加入员工姓名（owners 字段已经记录，正文不需要）。
+
+────────────────────────────
+输出规模
+────────────────────────────
+- 最终 projects 数组通常 3-8 个（视部门规模）。超过 8 个说明 importance≤2 的项目漏 drop 了。
+- 每个 ProjectRollup 的 kpi/projects/risks/next_week 数组各通常 ≤4 条，超过应再合并。
+- cross_cutting_highlights 严格 1-3 条。
+
+不要解释，直接输出 JSON。"""
 
 
-def _build_reduce_prompt(
+def _build_plan_prompt(
     facts_list: list[EmployeeFacts],
+    dept_name: str,
+    iso_week: str,
+    not_submitted: list[str] | None = None,
+) -> tuple[str, str]:
+    payload = {
+        "dept_name":     dept_name,
+        "iso_week":      iso_week,
+        "employees":     facts_list,
+        "not_submitted": not_submitted or [],
+    }
+    user = (
+        f"以下是输入数据，请生成 ReportPlan JSON：\n"
+        f"```json\n{json.dumps(payload, ensure_ascii=False, indent=2)}\n```"
+    )
+    return _PLAN_SYSTEM, user
+
+
+async def plan_report(
+    facts_list: list[EmployeeFacts],
+    dept_name: str,
+    iso_week: str,
+    llm_provider,
+    session_id: str,
+    not_submitted: list[str] | None = None,
+) -> ReportPlan:
+    """[STAGE B] Build a ReportPlan from per-employee FactItems.
+
+    Single LLM call. The model's job is dedup + ranking + cross-cut
+    selection — pure structural reasoning over structured input. Facts
+    cannot drift because they arrive (and leave) as JSON, not prose.
+
+    On parse failure, returns an empty plan with all employees flagged as
+    low_quality (so the manager sees the failure mode rather than a blank
+    report).
+    """
+    sys_p, usr_p = _build_plan_prompt(facts_list, dept_name, iso_week, not_submitted)
+    empty: ReportPlan = {
+        "cross_cutting_highlights": [],
+        "projects":                 [],
+        "low_quality_members":      [],
+    }
+    try:
+        resp = await llm_provider.text_chat(
+            prompt=usr_p, system_prompt=sys_p, session_id=session_id,
+        )
+    except Exception as e:
+        logger.warning(f"[Plan] LLM 调用失败: {e}")
+        return {
+            **empty,
+            "low_quality_members": [
+                {"name": f["name"], "reason": "规划阶段失败"} for f in facts_list
+            ],
+        }
+
+    raw = (resp.completion_text or "").strip()
+    if raw.startswith("```"):
+        raw = raw.split("```")[1].lstrip("json").strip()
+
+    try:
+        parsed = json.loads(raw)
+    except json.JSONDecodeError as e:
+        logger.warning(f"[Plan] JSON 解析失败: {e} | 原始: {raw[:300]}")
+        return {
+            **empty,
+            "low_quality_members": [
+                {"name": f["name"], "reason": "规划阶段返回非 JSON"} for f in facts_list
+            ],
+        }
+    if not isinstance(parsed, dict):
+        return empty
+
+    def _str_list(v) -> list[str]:
+        if not isinstance(v, list):
+            return []
+        return [str(x).strip() for x in v if str(x).strip()]
+
+    projects_out: list[ProjectRollup] = []
+    for p in parsed.get("projects", []) or []:
+        if not isinstance(p, dict):
+            continue
+        try:
+            importance = int(p.get("importance", 0))
+        except (TypeError, ValueError):
+            importance = 0
+        if importance < 2:
+            continue  # plan rule: drop importance=1
+        projects_out.append({
+            "project_id":     str(p.get("project_id", "") or "_misc").strip().lower() or "_misc",
+            "display_name":   str(p.get("display_name", "") or "").strip() or "其他",
+            "importance":     importance,
+            "owners":         _str_list(p.get("owners")),
+            "kpi":            _str_list(p.get("kpi")),
+            "projects":       _str_list(p.get("projects")),
+            "risks":          _str_list(p.get("risks")),
+            "next_week":      _str_list(p.get("next_week")),
+            "merged_aliases": _str_list(p.get("merged_aliases")),
+        })
+    # Sort by importance descending (the model is asked to do this; enforce it)
+    projects_out.sort(key=lambda x: -x["importance"])
+
+    lqm_out: list[LowQualityMember] = []
+    for lqm in parsed.get("low_quality_members", []) or []:
+        if not isinstance(lqm, dict):
+            continue
+        name = str(lqm.get("name", "")).strip()
+        if not name:
+            continue
+        lqm_out.append({
+            "name":   name,
+            "reason": str(lqm.get("reason", "") or "").strip() or "—",
+        })
+
+    plan: ReportPlan = {
+        "cross_cutting_highlights": _str_list(parsed.get("cross_cutting_highlights"))[:3],
+        "projects":                 projects_out,
+        "low_quality_members":      lqm_out,
+    }
+    logger.info(
+        f"[Plan] dept={dept_name} → "
+        f"{len(plan['projects'])} projects, "
+        f"{len(plan['cross_cutting_highlights'])} highlights, "
+        f"{len(plan['low_quality_members'])} low-quality"
+    )
+    return plan
+
+
+# ── STAGE C: write ────────────────────────────────────────────────────────────
+# Renders a ReportPlan as project-centric Markdown. Facts are LOCKED because
+# they arrive as structured input; the model can only reorder + rephrase.
+# Style is the primary variable here (structure is already decided by plan).
+#
+# Attention budget: style application ≈45%, readability ≈25%,
+# structure rendering ≈20%, compression ≈10%. Fact preservation is a
+# hard constraint enforced by the data flow.
+
+_WRITE_SYSTEM = """你是一名资深主管文笔助手。你的任务是把一份已经规划好的【ReportPlan JSON】渲染成 Markdown 部门周报，发给管理层阅读。
+
+────────────────────────────
+输入
+────────────────────────────
+- plan: ReportPlan JSON（已结构化、已去重、已按重要性排序、已挑好高光）
+- style_profile: 该管理者的写作风格档案（actuator-level dials；可能为空）
+- dept_name, iso_week, submitted, not_submitted: 上下文
+
+────────────────────────────
+事实保真（HARD — 不可违反）
+────────────────────────────
+- plan 里的每一条 text 必须出现在最终报告中。可以合并 / 缩短 / 顺序调整，**绝不能新增、删除、替换事实**。
+- 数字、百分比、JIRA 号、版本号、服务名、日期 100% 逐字保留。
+- 不要补"持续推进"、"为后续打基础"、"赋能业务"这类填充语句。
+- 如果某个 ProjectRollup 的 risks 或 next_week 数组为空，那一段直接写 " - —"（破折号），不要编造内容。
+- 不在正文加入员工姓名（owners 字段已展示在项目标题）。
+
+────────────────────────────
+输出结构（严格按此输出）
+────────────────────────────
+
+#### 🌟 本周高光
+{把 cross_cutting_highlights 每条写成一行，用 ** 加粗最关键的项目名 / 数字 / 动作}
+
+{ 仅当 low_quality_members 非空 OR not_submitted 非空时，输出下面整个「说明」段；否则整段省略 }
+#### 📝 说明
+- 未提交：{not_submitted 加顿号连接；如为空跳过此行}
+- 周报质量待补充：{low_quality_members 加顿号连接，格式 "姓名（reason）"；如为空跳过此行}
+
+#### 📊 项目进展
+{按 plan.projects 顺序，每个项目一个 ### 子块；importance≤2 的项目放进最后的「其他事项」}
+
+### {display_name}（负责人：{owners 顿号连接}）
+**本周完成**
+{把 kpi 数组渲染成 "- xxx" bullets；如为空写 "- —"}
+
+**项目进展**
+{把 projects 数组渲染成 bullets；如为空写 "- —"；如该项目所有里程碑已在本周完成且无 in-flight 里程碑，整段省略}
+
+**风险与阻塞**
+{risks bullets；如为空写 "- —"}
+
+**下周计划**
+{next_week bullets；如为空写 "- —"}
+
+{ 仅当存在 importance==2 的项目时输出 }
+#### 🗒️ 其他事项
+{把 importance==2 的项目压缩成一行，格式 "**{display_name}**: 一句话总结"}
+
+────────────────────────────
+渲染细则
+────────────────────────────
+
+1. **bullet 写法**
+   - 一条 bullet 1-2 句话。先写结果 / 状态，再写影响 / 后续。
+   - 主动语态，结果先行。"完成 X，提升 Y 至 Z%" 优于 "为了 Y，本周完成了 X"。
+   - 不要在 bullet 里重复 ### 项目标题。
+
+2. **章节标题里的 emoji**
+   - 默认按上方模板（🌟 📝 📊 🗒️）。
+   - 如果 style_profile.emoji_density == 0，去掉所有 emoji。
+   - 如果 style_profile.emoji_density > 0.5，可以在 bullet 行首适度加 ✅⚠️📌 等小图标。
+
+3. **style_profile 应用（如果 style_profile 提供）**
+   - sentence_length: short / medium / long → 控制每条 bullet 的句长。
+   - formality 1-5: 1=口语化, 3=正常职场, 5=正式书面。映射示例：
+       formality≥4 → 用 "已完成" 而非 "做完了"，用 "推进" 而非 "搞"
+       formality≤2 → 可以用更轻松的表述
+   - voice: "we" → 句首可用 "我们"；"team" → 用 "团队"；"neutral" → 不出现主语
+   - signature_phrases: 列表里的词 / 句式可以自然融入（不要堆砌）。
+   - banned_phrases: 列表里的词**绝对不出现**。常见全局禁用："总体来说"、"综上所述"、"首先其次最后"、"值得注意的是"、"为...奠定基础"、"赋能"、"抓手"、"保驾护航"。
+   - extras: 原文保留的额外指令，作为软约束遵守。
+
+4. **如果 style_profile 为空**
+   - 默认 formality=3, voice=neutral, emoji_density=0.3。
+   - 默认 banned_phrases = 上面常见全局禁用列表。
+
+────────────────────────────
+自检（输出前必须满足）
+────────────────────────────
+- 每个 importance≥3 的 ProjectRollup 是否独立成块？✓
+- cross_cutting_highlights 是否都出现在「本周高光」段？✓
+- 输出中是否有任何事实**不在** plan 里？必须 ✗
+- 是否有空段被填充了套话？必须 ✗
+
+直接输出 Markdown，不要解释，不要 ```代码块```。"""
+
+
+def _build_write_prompt(
+    plan: ReportPlan,
     dept_name: str,
     iso_week: str,
     submitted: list[str] | None = None,
@@ -749,56 +1187,64 @@ def _build_reduce_prompt(
 ) -> tuple[str, str]:
     from ..utils.manager_style import render_style_for_prompt
 
-    status_section = ""
-    if submitted is not None or not_submitted is not None:
-        status_section = (
-            f"本周提交情况（来自部门通讯录 + 提交检查）：\n"
-            f"- 已提交：{'、'.join(submitted) if submitted else '（无）'}\n"
-            f"- 未提交：{'、'.join(not_submitted) if not_submitted else '（无）'}\n\n"
-        )
-
-    # Personal style profile injection (same convention as single-call path)
     style_block = render_style_for_prompt(style_profile)
     style_section = (
-        f"## 个人风格档案（仅影响语气/措辞；不可改变事实、章节、排序与硬性约束）\n"
-        f"{style_block}\n\n"
-        if style_block else ""
+        f"## style_profile\n{style_block}\n\n"
+        if style_block else "## style_profile\n（未配置；使用默认风格）\n\n"
     )
 
-    # Serialize the facts list as compact JSON. The model reads structured
-    # input — no re-extraction needed.
-    facts_json = json.dumps(facts_list, ensure_ascii=False, indent=2)
+    status_section = (
+        f"## 上下文\n"
+        f"- 部门：{dept_name}\n"
+        f"- 周次：{iso_week}\n"
+        f"- 已提交：{'、'.join(submitted) if submitted else '（无）'}\n"
+        f"- 未提交：{'、'.join(not_submitted) if not_submitted else '（无）'}\n\n"
+    )
 
+    plan_json = json.dumps(plan, ensure_ascii=False, indent=2)
     user = (
         f"{status_section}"
         f"{style_section}"
-        f"部门：{dept_name}\n周次：{iso_week}\n\n"
-        f"以下是各成员本周事实清单（已结构化）：\n"
-        f"```json\n{facts_json}\n```\n\n"
-        f"请按照四章节格式合成面向管理层的部门周报。"
+        f"## ReportPlan\n```json\n{plan_json}\n```\n\n"
+        f"请按系统提示中的结构输出 Markdown。"
     )
-    if not_submitted:
-        user += "\n注意：上方「未提交」名单非空，必须在正文前输出「说明」段落列出这些成员。"
-    if any(f.get("quality_note") for f in facts_list):
-        user += "\n注意：部分员工的 quality_note 非空，必须在「说明」段落中列出对应姓名 + 原因。"
 
-    # Verbose logging when a style profile is in use, matching the
-    # single-call path. Helps verify the reducer prompt actually carries
-    # the manager's voice anchors.
     if style_block:
         logger.info(
-            f"[Prompt][Reduce] system_prompt: {len(_REDUCE_SYSTEM)} 字符 (constant _REDUCE_SYSTEM)"
+            f"[Prompt][Write] system={len(_WRITE_SYSTEM)} 字符, "
+            f"plan={len(plan['projects'])} projects, "
+            f"highlights={len(plan['cross_cutting_highlights'])}, "
+            f"style_block_len={len(style_block)}"
         )
-        if status_section:
-            logger.info(f"[Prompt][Reduce] + status_section:\n{status_section.rstrip()}")
-        logger.info(f"[Prompt][Reduce] + style_section:\n{style_section.rstrip()}")
-        logger.info(
-            f"[Prompt][Reduce] + facts: {len(facts_list)} 人, "
-            f"{len(facts_json)} 字符 JSON"
-        )
-        logger.info(f"[Prompt][Reduce] total user prompt: {len(user)} 字符")
 
-    return _REDUCE_SYSTEM, user
+    return _WRITE_SYSTEM, user
+
+
+async def write_report_stream(
+    plan: ReportPlan,
+    dept_name: str,
+    iso_week: str,
+    llm_provider,
+    session_id: str,
+    submitted: list[str] | None = None,
+    not_submitted: list[str] | None = None,
+    style_profile: dict | None = None,
+) -> AsyncGenerator[str, None]:
+    """[STAGE C] Stream the final Markdown report from a ReportPlan.
+
+    Yields cumulative text snapshots suitable for the existing CardKit
+    streaming path (_stream_to_card in pipelines/_base.py).
+    """
+    sys_p, usr_p = _build_write_prompt(
+        plan, dept_name, iso_week,
+        submitted=submitted, not_submitted=not_submitted,
+        style_profile=style_profile,
+    )
+    stream = llm_provider.text_chat_stream(
+        prompt=usr_p, system_prompt=sys_p, session_id=session_id,
+    )
+    async for snapshot in _consume_provider_stream(stream):
+        yield snapshot
 
 
 async def generate_report_stream_mapreduce(
@@ -812,52 +1258,51 @@ async def generate_report_stream_mapreduce(
     style_profile: dict | None = None,
     semaphore: "asyncio.Semaphore | None" = None,
 ) -> AsyncGenerator[str, None]:
-    """[ORCHESTRATOR] Map-reduce report generation (variant 1).
+    """[ORCHESTRATOR] 3-stage report generation: extract → plan → write.
 
-    Workflow:
-        1. MAP — fan-out: extract_employee_facts() per employee in parallel,
-           bounded by the provided semaphore. Each call is small, focused,
-           cache-friendly (same system prompt across all calls).
-        2. REDUCE — single streaming call. Takes the list[EmployeeFacts]
-           plus dept context + style profile, synthesizes the final report.
-           Output streams snapshot-by-snapshot for CardKit display.
+    Stage A (MAP, parallel):  extract_employee_facts per employee. Each call
+                              sees ONE source's report, produces project-tagged
+                              FactItems. Bounded by the shared LLM semaphore.
+    Stage B (single call):    plan_report — dedup across employees, group by
+                              project_id, rank by importance, pick highlights.
+                              Pure structured-input → structured-output call.
+    Stage C (streaming):      write_report_stream — render ReportPlan as
+                              project-centric Markdown, applying the manager's
+                              structured style profile. Streams to CardKit.
 
-    Pre-reduce snapshot: while map is running, yields short status snapshots
-    ("正在分析 N 个人的周报...") so the streaming card shows progress instead
-    of looking frozen. The reducer's first real snapshot replaces the status.
+    Progress snapshots are yielded between stages so the streaming card
+    shows progress instead of looking frozen during the LLM-heavy phases.
 
     Args:
-        employee_inputs: list of (employee_name, raw_report_text). Caller is
-                         responsible for splitting per-employee (trivial for
-                         bitable: one record = one employee; doc path stays
-                         on single-call generate_report_stream for now).
-        dept_name:       department name for header context
-        iso_week:        ISO week tag (e.g. "2026-W21") for header context
-        llm_provider:    AstrBot provider, used for both map and reduce calls
-        session_id:      session tag prefix; per-employee map calls append :name
+        employee_inputs: list of (source_name, raw_report_text). For bitable,
+                         each tuple = one employee. For doc-based depts,
+                         pass a single tuple ("团队", full_doc_text) since the
+                         doc can't be cheaply split per-employee at this layer.
+        dept_name:       department name (header context)
+        iso_week:        ISO week tag (e.g. "2026-W21")
+        llm_provider:    AstrBot provider, used for all 3 stages
+        session_id:      session tag prefix; stages append :extract / :plan / :write
         submitted /
-        not_submitted:   from check_submissions; passed to reducer for 说明 logic
-        style_profile:   personal style dict from manager_style.get_manager_style
-        semaphore:       LLM concurrency cap. Pass PipelineBase.llm_semaphore
-                         from the calling pipeline. If None, defaults to a
-                         fresh semaphore(8) — fine for testing, not production.
+        not_submitted:   from check_submissions; informs the plan stage's
+                         low_quality_members and the write stage's 说明 段
+        style_profile:   per-manager style dict from manager_style.get_manager_style
+                         (raw OR structured — render_style_for_prompt handles both)
+        semaphore:       LLM concurrency cap for the parallel map fan-out.
+                         Pass PipelineBase.llm_semaphore from the caller.
 
     Yields:
-        Cumulative text snapshots suitable for the existing CardKit
-        streaming-card path (_stream_to_card in pipelines/_base.py).
+        Cumulative text snapshots for _stream_to_card consumption.
     """
     if semaphore is None:
         semaphore = asyncio.Semaphore(8)
 
     n = len(employee_inputs)
-    logger.info(f"[MapReduce] start: dept={dept_name} N={n}")
+    logger.info(f"[3Stage] start: dept={dept_name} N={n}")
 
-    # ── Pre-reduce progress snapshot ─────────────────────────────────────────
-    # The card needs SOMETHING to render before the reducer starts streaming.
-    # Yield a placeholder; gets overwritten by the reducer's first real chunk.
-    yield f"正在分析 {n} 位成员的本周周报…"
+    # ── Pre-extract progress snapshot ───────────────────────────────────────
+    yield f"正在解析 {n} 份周报内容…"
 
-    # ── MAP: parallel per-employee extraction ────────────────────────────────
+    # ── STAGE A — parallel per-source extraction ────────────────────────────
     async def _bounded_extract(name: str, raw: str) -> EmployeeFacts:
         async with semaphore:
             return await extract_employee_facts(
@@ -865,36 +1310,55 @@ async def generate_report_stream_mapreduce(
                 session_id=f"{session_id}:extract:{name}",
             )
 
-    map_tasks = [
+    extract_tasks = [
         asyncio.create_task(_bounded_extract(name, raw))
         for name, raw in employee_inputs
     ]
-    # gather with return_exceptions=False — _bounded_extract already swallows
-    # per-employee errors into a quality_note, so no task should raise.
-    facts_list: list[EmployeeFacts] = list(await asyncio.gather(*map_tasks))
+    facts_list: list[EmployeeFacts] = list(await asyncio.gather(*extract_tasks))
 
-    # Log map-phase summary so it's easy to see which employees produced thin output
+    # Map-phase observability: which sources gave us thin output?
     for f in facts_list:
+        # Count items per category for quick scan of extraction quality
+        by_cat: dict[str, int] = {"kpi": 0, "projects": 0, "risks": 0, "next_week": 0}
+        for it in f["items"]:
+            cat = it["category"]
+            if cat in by_cat:
+                by_cat[cat] += 1
         logger.info(
-            f"[MapReduce] extracted name={f['name']!r} "
-            f"kpi={len(f['kpi'])} proj={len(f['projects'])} "
-            f"risks={len(f['risks'])} next={len(f['next_week'])} "
+            f"[3Stage][Extract] name={f['name']!r} items={len(f['items'])} "
+            f"kpi={by_cat['kpi']} proj={by_cat['projects']} "
+            f"risks={by_cat['risks']} next={by_cat['next_week']} "
             f"quality_note={f['quality_note']!r}"
         )
 
-    yield f"已分析 {n} 人，正在合成部门周报…"
+    yield f"已解析 {n} 份周报，正在按项目整合…"
 
-    # ── REDUCE: single streaming synthesis call ──────────────────────────────
-    sys_p, usr_p = _build_reduce_prompt(
-        facts_list, dept_name, iso_week,
+    # ── STAGE B — single planning call (JSON in / JSON out) ─────────────────
+    plan = await plan_report(
+        facts_list, dept_name, iso_week, llm_provider,
+        session_id=f"{session_id}:plan",
+        not_submitted=not_submitted,
+    )
+
+    if not plan["projects"]:
+        # Nothing to write. Surface a soft message instead of an empty card.
+        logger.warning(f"[3Stage] plan produced 0 projects for dept={dept_name}")
+        yield "本周未抽取到可呈报的项目内容。可能原因：周报内容过少 / 全部被 importance=1 过滤。"
+        return
+
+    yield (
+        f"已规划 {len(plan['projects'])} 个项目"
+        f"（{len(plan['cross_cutting_highlights'])} 条本周高光）"
+        f"，正在生成周报…"
+    )
+
+    # ── STAGE C — streaming write ────────────────────────────────────────────
+    async for snapshot in write_report_stream(
+        plan, dept_name, iso_week, llm_provider,
+        session_id=f"{session_id}:write",
         submitted=submitted, not_submitted=not_submitted,
         style_profile=style_profile,
-    )
-    stream = llm_provider.text_chat_stream(
-        prompt=usr_p, system_prompt=sys_p,
-        session_id=f"{session_id}:reduce",
-    )
-    async for snapshot in _consume_provider_stream(stream):
+    ):
         yield snapshot
 
 
