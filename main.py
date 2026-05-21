@@ -144,28 +144,6 @@ class MyPlugin(Star):
 #                      General Commands
 #==============================================================
 
-    @filter.command("helloworld")
-    async def helloworld(self, event: AstrMessageEvent):
-        """这是一个 hello world 指令"""
-        user_name = event.get_sender_name()
-        logger.info("✅ Hello World 指令被触发了！")
-        message_str = event.message_str
-        yield event.plain_result(f"Hello, {user_name}, 你发了 {message_str}!")
-
-    @filter.command("创建周报总结")
-    async def create_weekly_report(self, event: AstrMessageEvent):
-        """这是一个创建周报总结的指令"""
-        user_name = event.get_sender_name()
-        logger.info("✅ 创建周报总结指令被触发了！")
-        weekly_report = f"{user_name} 的周报总结：\n- 完成了任务 A\n- 参与了会议 B\n- 学习了新技术 C"
-        yield event.plain_result(weekly_report)
-
-    @filter.event_message_type(filter.EventMessageType.ALL)
-    @filter.command("关于WRSbot")
-    async def about_wrsbot(self, event: AstrMessageEvent):
-        """这是一个关于WRSbot的指令"""
-        yield event.plain_result("WRSbot 是一个基于 AstrBot 框架的机器人插件。\n 它可以帮助用户生成周报总结，并提供一些关于 WRSbot 的信息。")
-
     @filter.command("whoami")
     async def cmd_whoami(self, event: AstrMessageEvent):
         """转储当前消息事件中所有可获取的用户、会话、平台信息。"""
@@ -520,8 +498,6 @@ class MyPlugin(Star):
         if not self._GROUP_COMMANDS:
             self._GROUP_COMMANDS = {
                 "whoami":                     self.cmd_whoami,
-                "关于WRSbot":                 self.about_wrsbot,
-                "helloworld":                 self.helloworld,
                 "Hello":                      self.cmd_send_wrs_welcome,
                 "check_user":                 self.cmd_check_user,
                 "test_feishu_contact":        self.test_feishu_contact,
