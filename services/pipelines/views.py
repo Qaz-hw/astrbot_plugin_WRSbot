@@ -57,13 +57,22 @@ class ViewsPipelines(PipelineBase):
             ]
             if not managed:
                 logger.warning(f"[AdminView] 未找到管理的部门: open_id={open_id}")
+                await self._dm_text(
+                    open_id,
+                    "您当前账户不是任何部门的负责人，无法查看管理视图。如有疑问请联系系统管理员。",
+                )
                 return
 
             dept = managed[0]["dept"]
+            dept_name = dept.name or ""
             open_dept_id = getattr(dept, "open_department_id", "") or ""
             folder_token = get_dept_folder_token(open_dept_id)
             if not folder_token:
-                logger.warning(f"[AdminView] 文件夹未绑定: dept={dept.name}")
+                logger.warning(f"[AdminView] 文件夹未绑定: dept={dept_name}")
+                await self._dm_text(
+                    open_id,
+                    f"「{dept_name}」尚未绑定周报文件夹。请执行 /文件夹配置 完成绑定后再试。",
+                )
                 return
 
             # ── Find this week's file/table ──────────────────────────────────
@@ -91,16 +100,28 @@ class ViewsPipelines(PipelineBase):
                 )
                 if not weekly_file:
                     logger.warning(f"[AdminView] 未找到本周文件: folder={folder_token}")
+                    await self._dm_text(
+                        open_id,
+                        f"「{dept_name}」本周未找到周报文件。请确认本周周报已在绑定文件夹中创建。",
+                    )
                     return
 
             # ── Submission check ─────────────────────────────────────────────
             if weekly_file.get("type") == "bitable" and not self.bitable_service:
                 logger.warning("[AdminView] bitable_service 不存在，无法处理多维表格")
+                await self._dm_text(
+                    open_id,
+                    "Bitable 服务未启用，无法读取多维表格周报。请联系系统管理员。",
+                )
                 return
 
             provider = self.context.get_using_provider(umo=f"lark:open_id:{open_id}")
             if not provider:
                 logger.warning(f"[AdminView] 未找到 LLM provider: open_id={open_id}")
+                await self._dm_text(
+                    open_id,
+                    "当前没有可用的 LLM provider，无法分析周报提交情况。请联系系统管理员配置。",
+                )
                 return
 
             result = await check_submissions(
@@ -114,12 +135,20 @@ class ViewsPipelines(PipelineBase):
             )
             if not result["ok"]:
                 logger.warning(f"[AdminView] 提交检查失败: {result['error']}")
+                await self._dm_text(
+                    open_id,
+                    f"周报提交情况检查失败：{result['error']}。请稍后重试或联系系统管理员。",
+                )
                 return
 
             await self.card_service.send_admin_view_card(open_id, result, message_id)
 
         except Exception as e:
             logger.error(f"[AdminView] 管理员视图加载失败: {e}")
+            await self._dm_text(
+                open_id,
+                f"加载管理视图时出现异常：{e}。请稍后重试或联系系统管理员。",
+            )
 
     async def user_view(self, open_id: str, message_id: str = "") -> None:
         """

@@ -35,8 +35,9 @@ class ReportPipelines(PipelineBase):
             4. Read raw content (Bitable records or Doc text)
             5. Run check_submissions in parallel — the LLM can prepend a
                「说明」 section if anyone hasn't submitted / quality is low
-            6. Single LLM pass via generate_report_stream — combined fact
-               extraction + executive style, streamed into a CardKit card
+            6. 3-stage pipeline via generate_report_stream_mapreduce:
+                 extract (parallel per source) → plan (single JSON call)
+                 → write (streaming Markdown to CardKit card)
             7. Persist the final draft to sp keyed by f"draft:{open_id}"
                (the rewrite pipeline reads from here)
             8. Patch the generating card → action card (rewrite/submit
@@ -176,9 +177,48 @@ class ReportPipelines(PipelineBase):
             style_profile = await get_manager_style(open_id)
 
             if weekly_file["type"] == "bitable":
-                employee_inputs = BitableService.split_records_per_employee(records)
+                raw_inputs = BitableService.split_records_per_employee(records)
+
+                # Pre-filter BEFORE the parallel extract fan-out — empty / "None"
+                # rows + non-submitters waste an LLM call per row. check_submissions
+                # already produced `submitted`: the authoritative list of people
+                # whose name AND content the LLM saw. Restrict extract to that set.
+                # If check_submissions failed (submitted == []), fall back to a
+                # raw-content length heuristic so generation still works.
+                import re as _re
+                _PLACEHOLDER_NAMES = {"", "none", "null", "无", "未知", "n/a", "na"}
+                submitted_norm = {s.strip().lower() for s in submitted if s and s.strip()}
+                employee_inputs: list[tuple[str, str]] = []
+                dropped_placeholder = 0
+                dropped_not_submitted = 0
+                dropped_thin = 0
+                for name, raw in raw_inputs:
+                    n_stripped = (name or "").strip()
+                    n_lower    = n_stripped.lower()
+                    # 1. Hard blacklist — never extract on these.
+                    if not n_stripped or n_lower in _PLACEHOLDER_NAMES:
+                        dropped_placeholder += 1
+                        continue
+                    if _re.fullmatch(r"未知成员\d*", n_stripped):
+                        dropped_placeholder += 1
+                        continue
+                    # 2. Prefer the LLM-validated submitted list.
+                    if submitted_norm:
+                        if n_lower in submitted_norm:
+                            employee_inputs.append((n_stripped, raw))
+                        else:
+                            dropped_not_submitted += 1
+                        continue
+                    # 3. No submitted list → keep rows with substantive content.
+                    if len((raw or "").strip()) < 20:
+                        dropped_thin += 1
+                        continue
+                    employee_inputs.append((n_stripped, raw))
+
                 logger.info(
-                    f"[Generate] 3-stage path (bitable): N={len(employee_inputs)} 员工"
+                    f"[Generate] 3-stage path (bitable): N={len(employee_inputs)} 员工 "
+                    f"（过滤前 {len(raw_inputs)}，丢弃 placeholder={dropped_placeholder} "
+                    f"未提交={dropped_not_submitted} 内容稀疏={dropped_thin}）"
                 )
             else:
                 employee_inputs = [("团队", content)]
@@ -296,6 +336,7 @@ class ReportPipelines(PipelineBase):
         except Exception as e:
             logger.error(f"[Rewrite] 改写失败: {e}")
 
+    # TODO: when LLM generating report, the headings and stuff are compermised for lark's message display for UX, will raise formating not alighn issue for writing into doc.
     async def submit(self, open_id: str) -> None:
         """
         [PIPELINE] Write the stored draft into the bound weekly file.
@@ -394,6 +435,17 @@ class ReportPipelines(PipelineBase):
                 # Prepend a heading so the appended section is visually anchored
                 # at the doc's tail. Re-submitting will append another section —
                 # caller is responsible for any dedupe.
+                #
+                # TODO: heading levels (####/###) and bullet styles emitted by the
+                # write stage are tuned for Lark interactive-card display (the
+                # streaming CardKit markdown looks best with these depths). When
+                # that same markdown is appended into an existing Feishu Doc,
+                # the depths often don't line up with the doc's own heading
+                # hierarchy, so the appended section reads as visually misaligned.
+                # Fix path: detect the doc's existing top-level heading depth
+                # before append and shift the report's heading levels to match
+                # (or pass a format hint into the write stage so generation
+                # produces doc-aligned markdown in the first place).
                 doc_id = weekly_file["token"]
                 heading = f"#### 部门总结（{dept_name}）" if dept_name else "#### 部门总结"
                 report_with_heading = f"{heading}\n{final_text}"

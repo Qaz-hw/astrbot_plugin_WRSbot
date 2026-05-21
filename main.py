@@ -422,6 +422,77 @@ class MyPlugin(Star):
         )
         yield event.plain_result(f"✅ 当前会话人格已切换为「{name}」。")
 
+    @filter.command("my_style")
+    async def my_style(self, event: AstrMessageEvent):
+        """[Dev] Dump the caller's saved personal style profile from sp.
+
+        Shows both the raw fields (tone_tags / custom_instructions /
+        writing_samples) and the structured_profile (actuator dials computed
+        at save time). Useful for debugging when the view-style card shows
+        an unexpected value — e.g. "tone tags don't display" usually means
+        the catalog filter rejected them; you'll see the saved list here.
+
+        Usage: /my_style
+        """
+        from .utils.manager_style import get_manager_style, STYLE_TAG_CATALOG
+
+        open_id = event.get_sender_id()
+        profile = await get_manager_style(open_id)
+
+        tone_tags = profile.get("tone_tags") or []
+        custom    = (profile.get("custom_instructions") or "").strip()
+        samples   = (profile.get("writing_samples") or "").strip()
+        updated   = profile.get("updated_at") or "（尚未保存）"
+        structured = profile.get("structured_profile")
+
+        lines: list[str] = [
+            "══ 个人风格档案 ══",
+            f"open_id      : {open_id}",
+            f"最后更新     : {updated}",
+            "",
+            "── 原始字段（raw, saved verbatim）──",
+            f"tone_tags ({len(tone_tags)}): {tone_tags if tone_tags else '（空 — 卡片可能未发送 / 被目录过滤）'}",
+            f"custom_instructions ({len(custom)} 字):",
+            f"  {custom or '（空）'}",
+            f"writing_samples ({len(samples)} 字):",
+        ]
+        if samples:
+            # Truncate long samples in the dump
+            preview = samples if len(samples) <= 600 else (samples[:600] + "\n  …(truncated)")
+            for ln in preview.splitlines():
+                lines.append(f"  {ln}")
+        else:
+            lines.append("  （空）")
+        lines.append("")
+
+        # Structured profile (actuator dials computed at save time)
+        if isinstance(structured, dict) and structured:
+            lines.append("── 结构化档案（structured_profile, 写入阶段使用）──")
+            lines.append(f"sentence_length       : {structured.get('sentence_length')}")
+            lines.append(f"formality (1-5)       : {structured.get('formality')}")
+            lines.append(f"voice                 : {structured.get('voice')}")
+            lines.append(f"emoji_density (0-1)   : {structured.get('emoji_density')}")
+            lines.append(f"tone_summary          : {structured.get('tone_summary') or '（空）'}")
+            sigs = structured.get("signature_phrases") or []
+            lines.append(f"signature_phrases ({len(sigs)}): {sigs if sigs else '（空）'}")
+            trans = structured.get("preferred_transitions") or []
+            lines.append(f"preferred_transitions ({len(trans)}): {trans if trans else '（空）'}")
+            banned = structured.get("banned_phrases") or []
+            lines.append(f"banned_phrases ({len(banned)}): {banned[:6]}" + ("..." if len(banned) > 6 else ""))
+            extras = (structured.get("extras") or "").strip()
+            lines.append(f"extras                : {extras or '（空）'}")
+        else:
+            lines.append("── 结构化档案：尚未生成 ──")
+            lines.append("  (LLM 结构化步骤未跑或失败 — 保存时缺少 llm_provider)")
+        lines.append("")
+
+        # Diagnostic — show catalog so user can compare
+        lines.append("── 调试参考 ──")
+        lines.append(f"STYLE_TAG_CATALOG (saved tags must match exactly): {STYLE_TAG_CATALOG}")
+        lines.append(f"sp key: global:wrsbot:manager_style:{open_id}")
+
+        yield event.plain_result("\n".join(lines))
+
 #==============================================================
 #                       Event Listeners
 #==============================================================
@@ -451,8 +522,6 @@ class MyPlugin(Star):
                 "whoami":                     self.cmd_whoami,
                 "关于WRSbot":                 self.about_wrsbot,
                 "helloworld":                 self.helloworld,
-                "发起告警":                   self.cmd_send_alarm,
-                "你好":                       self.cmd_send_testing_welcome,
                 "Hello":                      self.cmd_send_wrs_welcome,
                 "check_user":                 self.cmd_check_user,
                 "test_feishu_contact":        self.test_feishu_contact,
@@ -461,9 +530,9 @@ class MyPlugin(Star):
                 "set_doc_folder":             self.set_doc_folder,
                 "test_feishu_doc":            self.test_feishu_doc,
                 "test_weekly_file":           self.test_weekly_file,
-                "创建周报总结":               self.create_weekly_report,
                 "test_persona":               self.test_persona,
                 "set_persona":                self.set_persona,
+                "my_style":                   self.my_style,
                 "test_llm":                   self.test_llm,
                 "dump_bindings":              self.dump_bindings,
             }
@@ -591,12 +660,17 @@ class MyPlugin(Star):
         )
 
         # ── Route by intent ───────────────────────────────────────────────
+        # IMPORTANT: call event.stop_event() AFTER any `yield` in this
+        # handler. AstrBot's scheduler breaks out of the handler generator
+        # the next time it checks `event.is_stopped()` after a yield — so
+        # stopping the event before yielding means the post-yield code
+        # (e.g. admin_view) is never reached. See scheduler.py:52-58.
         if intent == "generate_summary":
             if not is_admin:
                 return  # unauthorized — silent skip, no error to user
-            event.stop_event()
             if is_group:
                 yield event.plain_result("正在为您加载部门管理视图，请到私聊查看 📊")
+            event.stop_event()
             try:
                 if self.card_service.is_fully_bound(open_id):
                     await self.views.admin_view(open_id)
@@ -607,13 +681,13 @@ class MyPlugin(Star):
             return
 
         if intent == "get_writing_folder":
-            event.stop_event()
             try:
                 reply = await self.views._build_writing_folder_reply(open_id)
             except Exception as e:
                 logger.error(f"[NaturalTrigger] 查询周报文件夹失败: {e}")
                 reply = "查询周报文件夹时出错，请稍后重试或联系部门负责人。"
             yield event.plain_result(reply)
+            event.stop_event()
             return
 
     # NOTE: the old keyword_card_reply handler ("周报" / "帮助" substring →

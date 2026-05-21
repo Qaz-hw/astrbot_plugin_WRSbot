@@ -606,12 +606,47 @@ class LarkCardService:
             logger.info("[Lark_card] 保存个人风格")
             form_value: dict = action.form_value or {} if action is not None else {}
 
+            # Feishu multi-select sends tone_tags_input in several possible
+            # shapes depending on builder config:
+            #   - list[str]                              (simplest case)
+            #   - list[dict] with {value, text} entries  (rich option format)
+            #   - str (comma-separated)                  (rare; some legacy templates)
+            # Normalize all three to list[str] of the OPTION KEYS (must match
+            # STYLE_TAG_CATALOG exactly downstream).
             raw_tags = form_value.get("tone_tags_input", [])
-            if not isinstance(raw_tags, list):
-                raw_tags = [raw_tags] if raw_tags else []
-            tone_tags = [str(t) for t in raw_tags if t]
+            logger.info(
+                f"[Lark_card] save_manager_style raw tone_tags_input "
+                f"(type={type(raw_tags).__name__}): {raw_tags!r}"
+            )
+
+            tone_tags: list[str] = []
+            if isinstance(raw_tags, list):
+                for item in raw_tags:
+                    if isinstance(item, str):
+                        tone_tags.append(item.strip())
+                    elif isinstance(item, dict):
+                        # Feishu select-option shape: prefer "value", fall back
+                        # to "text" (some templates only set text).
+                        v = item.get("value") or item.get("text") or ""
+                        if v:
+                            tone_tags.append(str(v).strip())
+            elif isinstance(raw_tags, str):
+                # Comma-separated fallback
+                tone_tags = [t.strip() for t in raw_tags.split(",") if t.strip()]
+            elif isinstance(raw_tags, dict):
+                v = raw_tags.get("value") or raw_tags.get("text") or ""
+                if v:
+                    tone_tags = [str(v).strip()]
+
+            tone_tags = [t for t in tone_tags if t]  # drop empties
+
             custom  = str(form_value.get("custom_instructions_input", "") or "")
             samples = str(form_value.get("writing_samples_input", "") or "")
+
+            logger.info(
+                f"[Lark_card] save_manager_style normalized → "
+                f"tone_tags={tone_tags} custom_len={len(custom)} sample_len={len(samples)}"
+            )
 
             if self._save_style_fn:
                 asyncio.create_task(

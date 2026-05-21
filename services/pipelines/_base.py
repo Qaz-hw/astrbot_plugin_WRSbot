@@ -207,6 +207,26 @@ class PipelineBase:
 
         return snapshot
 
+    async def _dm_text(self, open_id: str, text: str) -> None:
+        """
+        [HELPER] Send a plain-text DM to a user. Swallow send errors so
+        callers can use this as an error-notification fallback without
+        risking a secondary exception masking the original failure.
+        """
+        if not self.lark_api or not open_id or not text:
+            return
+        from astrbot.core.platform.sources.lark.lark_event import LarkMessageEvent
+        try:
+            await LarkMessageEvent._send_im_message(
+                self.lark_api,
+                content=json.dumps({"text": text}, ensure_ascii=False),
+                msg_type="text",
+                receive_id=open_id,
+                receive_id_type="open_id",
+            )
+        except Exception as e:
+            logger.warning(f"[DM] 发送失败 open_id={open_id}: {e}")
+
     async def _send_report_message(
         self,
         open_id: str,

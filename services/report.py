@@ -44,18 +44,13 @@ from .contact import ContactService
 class FactItem(TypedDict):
     """One atomic fact extracted from one employee's report.
 
-    Each bullet/line in the original report becomes ONE FactItem. The
-    extract stage is responsible for atomizing ("we did A and B" → 2 items)
-    and tagging each one with project + category + report_worthiness.
+    Each bullet/line becomes ONE FactItem. Extract stage atomizes
+    ("did A and B" → 2 items) and tags with project + category.
     """
-    category:      str   # "kpi" | "projects" | "risks" | "next_week"
-    project_id:    str   # normalized lowercase id; "_misc" if no project
-    project_name:  str   # human-readable display name
-    text:          str   # the atomic fact (numbers/IDs verbatim)
-    report_worthy: bool  # True if measurable outcome / concrete next action /
-                         # mgmt-visible blocker; False for process noise
-                         # (chat, FYIs, learning, undecided discussions).
-                         # Plan stage drops False items.
+    category:     str   # "kpi" | "projects" | "risks" | "next_week"
+    project_id:   str   # normalized lowercase id; "_misc" if no project
+    project_name: str   # human-readable display name
+    text:         str   # the atomic fact (numbers/IDs verbatim)
 
 
 class EmployeeFacts(TypedDict):
@@ -68,18 +63,17 @@ class EmployeeFacts(TypedDict):
 class ProjectRollup(TypedDict):
     """One project's slot in the ReportPlan, post-dedup + ranking.
 
-    No owners field by design — the user explicitly does not want personal
-    attribution in project blocks. quality_note attribution still appears
-    in low_quality_members (说明 段), but project content is depersonalized.
+    No owners field — managers don't want personal attribution in
+    project blocks. Personal attribution only appears in low_quality_members.
     """
-    project_id:     str       # normalized id (post any alias merging)
-    display_name:   str       # human-readable
-    importance:     int       # 1-5; only ≥2 makes it into the plan
-    kpi:            list[str] # post-dedup text, executive-grade bullets
+    project_id:     str
+    display_name:   str
+    importance:     int            # 1-5; only ≥2 makes it into the plan
+    kpi:            list[str]
     projects:       list[str]
     risks:          list[str]
     next_week:      list[str]
-    merged_aliases: list[str] # other project_ids merged into this one
+    merged_aliases: list[str]      # other project_ids merged into this one
 
 
 class LowQualityMember(TypedDict):
@@ -134,7 +128,8 @@ def _md_to_plain(text: str) -> str:
 
 # ── Prompt builders ─────────────────────────────────────────────────────────
 # Kept private to this module — they're only called by the public functions
-# below (check_submissions / generate_report_stream / rewrite_summary_stream).
+# below (check_submissions / rewrite_summary_stream / the 3-stage pipeline
+# fns extract_employee_facts / plan_report / write_report_stream).
 
 def _build_submission_check_prompt(members: list[dict], content: str, file_type: str) -> str:
     member_lines = "\n".join(
@@ -161,141 +156,71 @@ def _build_submission_check_prompt(members: list[dict], content: str, file_type:
     )
 
 
-_GENERATE_SYSTEM = """你是互联网公司“部门管理周报助手”。你的任务是把多名员工的原始周报，压缩成一份可直接发给管理层的部门周报。
-
-你的目标按优先级排序：
-A. 事实正确
-B. 管理层一眼读懂
-C. 去重压缩
-D. 风格统一
-
-你会收到：受众（audience=leader 或 exec）、部门、周次、人员映射表、未提交名单、无效提交名单、事实锁定清单、style_input、原始周报。
-
-硬性约束：
-1) 只使用原文与输入元数据中的事实。没有证据就不写；不猜测因果、不补写结论、不发明影响。
-2) 以下内容必须逐字保留：数字、百分比、比较关系、单位、日期/时间点、JIRA/缺陷号、版本号、服务/模块名、接口/字段名。
-3) 若提供了“事实锁定清单”，清单中的字符串优先按原样出现在输出中；不得改写其写法。
-4) 若多份原文之间存在冲突：优先保留共同一致的事实；无法统一的部分不要擅自裁决。若冲突影响管理判断，在“说明”中用一句话指出“原始周报存在信息不一致：……”
-5) 人名默认不进入正文；只允许在“说明”中出现未提交、无效提交或必须点名的责任缺口。
-6) 同一事项跨多人提及时必须合并。判断是否为同一事项的优先顺序是：项目/系统名 > JIRA/版本号/里程碑 > 同一目标结果 > 同一时间窗口。
-7) 同一事项不得在不同章节重复堆砌：
-   - 本周KPI与业务进展：写结果、上线、闭环、量化收益
-   - 重点项目进展：写仍在推进中的里程碑状态
-   - 风险与阻塞项：写当前仍影响进度、质量、联调、发布的阻塞
-   - 下周计划：写下周明确动作
-8) 若某事项已在 KPI 章节写明“完成并产生结果”，项目章节不要重复同一句；只有仍有里程碑待推进时才继续写项目状态。
-9) 每条要点 1–2 句话，先写结果/状态，再写影响/后续。
-10) 章节内按重要性排序：线上与业务影响 > 关键项目里程碑 > 风险/延期 > 文档与内部优化。
-11) 压缩率：
-   - audience=leader：输出约为原文的 45%–55%
-   - audience=exec：输出约为原文的 40%–45%
-12) style_input 只影响语气、抽象层级、压缩力度；不得改变事实、章节、排序与硬性约束。
-13) 禁止空话/套话：总体来说、综上所述、首先/其次/最后、值得注意的是、稳步推进相关工作、为后续奠定基础、赋能、抓手、保驾护航。
-14) 优先词汇：完成、上线、修复、推进、联调、对齐、闭环、复盘、灰度、延期、阻塞、定稿、启动、交付、输出。
-15) 若某正式章节确无内容，用“ - 无新增关键事项。”填充，不要删除章节。
-
-输出格式（严格）：
-#### 说明
-（仅当未提交 / 无效提交 / 冲突存在时输出，否则整段删除）
-
-#### 本周KPI与业务进展
-- ...
-
-#### 重点项目进展
-- ...
-
-#### 风险与阻塞项
-- ...
-
-#### 下周计划
-- ...
-"""
 
 
-def _build_generate_prompt(
-    content: str,
-    dept_name: str,
-    iso_week: str,
-    submitted: list[str] | None = None,
-    not_submitted: list[str] | None = None,
-    style_profile: dict | None = None,
-) -> tuple[str, str]:
-    from ..utils.manager_style import render_style_for_prompt
+_REWRITE_SYSTEM = """你是一名向部门负责人汇报的资深主管文笔助手。你的任务是按管理者给出的【额外改写要求】+【个人风格档案】，对一份已有的部门周报草稿做实质性的风格与措辞调整，**而不是仅做标点和措辞微调**。
 
-    status_section = ""
-    if submitted is not None or not_submitted is not None:
-        status_section = (
-            f"本周提交情况（来自部门通讯录 + 提交检查）：\n"
-            f"- 已提交：{'、'.join(submitted) if submitted else '（无）'}\n"
-            f"- 未提交：{'、'.join(not_submitted) if not_submitted else '（无）'}\n\n"
-        )
+────────────────────────────
+事实约束（HARD — 不可违反）
+────────────────────────────
+- 不得新增、删除、虚构、改写草稿中的任何事实。
+- 数字、百分比、JIRA / 缺陷号、版本号、服务 / 模块名、日期、时间点 100% 逐字保留。
+- 可重新组织语序、合并表述、缩短句子，但**不能删信息**。
+- **不要在正文或项目标题里出现任何员工姓名。** 草稿中如果意外出现了人名，改写时一并去掉（人名只允许在「说明」段保留）。
 
-    # Per-manager style profile — empty string when not configured. Slotted
-    # into the user prompt (not system) so per-manager content doesn't
-    # fragment the system-prompt cache across users.
-    style_block = render_style_for_prompt(style_profile)
-    style_section = (
-        f"## 个人风格档案（仅影响语气/措辞；不可改变事实、章节、排序与硬性约束）\n"
-        f"{style_block}\n\n"
-        if style_block else ""
-    )
+────────────────────────────
+结构约束（保持草稿的项目级布局）
+────────────────────────────
+草稿采用项目级（project-first）布局：
+    #### 🌟 本周高光
+    #### 📝 说明（可选）
+    #### 📊 项目进展
+    ### {项目 A}
+        **本周完成** / **项目进展** / **风险与阻塞** / **下周计划**
+    ### {项目 B}
+        ...
+    #### 🗒️ 其他事项（可选）
 
-    user = (
-        f"{status_section}"
-        f"{style_section}"
-        f"以下是【{dept_name}】{iso_week} 的全体成员周报原文：\n\n"
-        f"---\n{content}\n---\n\n"
-        f"请按照四章节格式，直接输出面向管理层的部门周报。"
-    )
-    if not_submitted:
-        user += "\n注意：上方「未提交」名单非空，必须在正文前输出「说明」段落列出这些成员。"
+改写规则：
+- **保留 ### 项目级标题不变**（项目名不要换、不要合并不同项目、不要拆分）。
+- 项目标题里**只有项目名**，绝不要带 "(负责人：…)"。
+- 每个项目内部的 4 个子标题（**本周完成** / **项目进展** / **风险与阻塞** / **下周计划**）保留。
+- 「说明」段（如有）必须原样保留，置于所有项目之前。
+- 「本周高光」段保留 1-3 条加粗强调形式。
+- 「其他事项」段（如有）保留。
 
-    # ── Verbose prompt logging (only when a personal style profile is in use) ──
-    # Helps verify the manager's tone_tags / custom_instructions / writing_samples
-    # actually land in the prompt that hits the LLM. Gated on style_block so we
-    # don't spam logs for managers without a saved profile.
-    if style_block:
-        logger.info(
-            f"[Prompt][Generate] system_prompt: {len(_GENERATE_SYSTEM)} 字符 (constant _GENERATE_SYSTEM)"
-        )
-        if status_section:
-            logger.info(f"[Prompt][Generate] + status_section:\n{status_section.rstrip()}")
-        logger.info(f"[Prompt][Generate] + style_section (个人风格档案):\n{style_section.rstrip()}")
-        logger.info(
-            f"[Prompt][Generate] + content header: 【{dept_name}】{iso_week} "
-            f"({len(content)} 字符 raw content omitted)"
-        )
-        if not_submitted:
-            logger.info(
-                f"[Prompt][Generate] + tail note: 必须输出说明段落 "
-                f"(not_submitted={not_submitted})"
-            )
-        logger.info(f"[Prompt][Generate] total user prompt: {len(user)} 字符")
+────────────────────────────
+风格转换（必须执行，不是可选）
+────────────────────────────
+- 每条 bullet 1-2 句话，先写结果 / 状态，再写影响 / 后续。
+- 主动语态、结果先行（"完成 X，性能 +12%" 优于 "为了 X，本周做了 Y"）。
+- 同一项目内，按重要性排序：业务影响 > 关键里程碑 > 风险 > 文档/内部优化。
+- 不复述项目标题（不要在 "本周完成" 段下写 "本周完成了..."）。
+- 抽象层级要统一：所有 bullet 在同一项目级 / 里程碑级，不要混入实现细节
+  （如 Redis key 拆分、helper 函数重构、单测补充等）；如果发现草稿里有这种粒度，
+  在改写时**滚动合并**为更高层级的表述（参考 plan 阶段的合并风格）。
 
-    return _GENERATE_SYSTEM, user
+────────────────────────────
+个人风格档案应用
+────────────────────────────
+- style_profile 提供的 actuator 字段（sentence_length / formality / voice /
+  emoji_density / preferred_transitions / banned_phrases / signature_phrases /
+  extras）必须按 [write 阶段] 的规则执行。
+- banned_phrases 列表中的词**绝对不出现**——禁用词由 style_profile 决定，
+  不再在本系统提示里硬编码全局禁用词。
+- signature_phrases 可以自然融入（不要堆砌）。
+- 如果 style_profile 为空，使用默认值：formality=3, voice=neutral, emoji_density=0.3。
 
+────────────────────────────
+自检（输出前必须满足）
+────────────────────────────
+- 改写结果与草稿逐项目逐 bullet 对照，事实是否 100% 保留？必须 ✓
+- ### 项目标题是否完全没改？必须 ✓
+- 4 个子标题（本周完成 / 项目进展 / 风险与阻塞 / 下周计划）是否在每个项目下都齐？必须 ✓
+- 正文是否完全不出现员工姓名？必须 ✓
+- 改动是否只是换同义词 / 加句号 / 调"完成"和"已完成"？如果是，**回到风格规则重新改写**。
 
-_REWRITE_SYSTEM = """你是一名向部门负责人汇报的资深主管文笔助手。
-你的任务是按用户给出的额外要求重新调整一份已有的部门周报，做实质性的风格与结构调整，而不是仅做标点和措辞微调。
-
-事实约束：
-- 不得删减、虚构、或改写草稿中的任何事实
-- 所有数据、版本号、工单号、量化指标、时间点必须原样保留
-- 可重新组织顺序、合并表述，但不得删除信息
-
-风格转换（必须执行，不是可选）：
-- 每条要点压缩为 1-2 句话，去除过程性细节，突出结果、影响、数字
-- 优先级排序：每个章节首条放最关键内容；次条次要；以此类推
-- 主动语态，结果先行（"完成 X，效果 Y" 优于 "为了 Y，本周做了 X"）
-- 禁止使用：总体来说、综上所述、首先其次最后、在当今、值得注意的是、不仅...而且、为...奠定基础
-- 优先使用职场用语：推进、落地、对齐、复盘、跟进、输出、闭环、拉齐
-- 保持原有的四章节结构（#### 标题格式不变）
-
-「说明」段落规则：
-- 草稿中的「说明」段落必须原样保留，置于所有章节之前
-- 不得删除、不得合并到正文章节、不得新增空段落
-
-判断你是否完成了实质性改写：把改写结果与草稿逐句对照，如果改动只是加句号、换同义词、调换"完成"和"已完成"，说明你没有做真正的风格转换——请回到上面的风格规则重新改写。"""
+直接输出改写后的 Markdown，不要解释、不要 ```代码块``` 包裹。"""
 
 
 def _build_rewrite_prompt(
@@ -591,6 +516,14 @@ async def _consume_provider_stream(llm_stream) -> AsyncGenerator[str, None]:
         yield accumulated.strip()
 
 
+# ─────────────────────────────────────────────────────────────────────────────
+# DEAD CODE (2026-05-21): generate_report_stream
+#
+# Single-call generate path. Replaced by the 3-stage pipeline (see
+# generate_report_stream_mapreduce below). No pipeline calls this anymore;
+# preserved as reference. Safe to delete once 3-stage is proven.
+# ─────────────────────────────────────────────────────────────────────────────
+'''
 async def generate_report_stream(
     content: str,
     dept_name: str,
@@ -601,15 +534,7 @@ async def generate_report_stream(
     not_submitted: list[str] | None = None,
     style_profile: dict | None = None,
 ) -> AsyncGenerator[str, None]:
-    """Single-pass report generation — fact extraction + executive style in one LLM call.
-
-    Replaces the old summarize → rewrite two-pass flow. Yields cumulative text
-    snapshots suitable for piping into a Feishu CardKit streaming card.
-
-    submitted / not_submitted: from check_submissions. When provided, the prompt
-    instructs the model to prepend a 「说明」 section listing missing members
-    and flagging any low-quality submissions.
-    """
+    """Single-pass report generation — fact extraction + executive style in one LLM call."""
     sys_p, usr_p = _build_generate_prompt(
         content, dept_name, iso_week,
         submitted=submitted, not_submitted=not_submitted,
@@ -620,6 +545,8 @@ async def generate_report_stream(
     )
     async for snapshot in _consume_provider_stream(stream):
         yield snapshot
+'''
+# ─── END DEAD CODE ──────────────────────────────────────────────────────────
 
 
 # ── Map-reduce report generation ──────────────────────────────────────────────
@@ -633,9 +560,12 @@ async def generate_report_stream(
 #   _EXTRACT_FACTS_SYSTEM — runs N times in parallel, one per employee
 #   _REDUCE_SYSTEM        — runs once, takes structured facts → final report
 #
-# The reduce prompt differs from _GENERATE_SYSTEM: it explicitly tells the
-# model the input is already-extracted structured facts, so it should focus
-# on synthesis / dedup / executive-style writing, NOT re-extraction.
+# Stage prompts are separated by responsibility:
+#   _EXTRACT_FACTS_SYSTEM tags atomic facts with project + category.
+#   _PLAN_SYSTEM dedups / groups / ranks / compresses into a ReportPlan.
+#   _WRITE_SYSTEM renders the plan as project-centric Markdown.
+# Each stage gets focused attention budget instead of one prompt juggling
+# extraction + synthesis + rendering simultaneously.
 #
 # ─── SCALE TARGET ───────────────────────────────────────────────────────────
 # Current design assumes 30–50 employees per dept. At this size, two stages
@@ -695,13 +625,13 @@ async def generate_report_stream(
 #
 # Attention budget: facts ≈90%, project tagging ≈8%, quality flag ≈2%.
 
-_EXTRACT_FACTS_SYSTEM = """你是一名周报事实结构化助手。你的工作是：把一份原始周报，逐条拆解成"原子事实"，每条事实都打上【项目标签】+【类别标签】+【是否值得进入部门周报】。
+_EXTRACT_FACTS_SYSTEM = """你是一名周报事实结构化助手。把一份原始周报，逐条拆解成"原子事实"，每条事实打上【项目标签】+【类别标签】。
 
 ────────────────────────────
 输入
 ────────────────────────────
 - name: 周报作者的姓名（或团队标识）
-- raw_report: 该作者本周写的原始周报文字（可能很乱：可能混着流水账、感想、Q&A 等）
+- raw_report: 该作者本周写的原始周报文字（可能混着流水账、感想、Q&A 等）
 
 ────────────────────────────
 输出
@@ -710,11 +640,10 @@ _EXTRACT_FACTS_SYSTEM = """你是一名周报事实结构化助手。你的工�
 {
   "items": [
     {
-      "category":      "kpi" | "projects" | "risks" | "next_week",
-      "project_id":    "<规范化的项目 id>",
-      "project_name":  "<项目显示名>",
-      "text":          "<一句话原子事实>",
-      "report_worthy": true | false
+      "category":     "kpi" | "projects" | "risks" | "next_week",
+      "project_id":   "<规范化的项目 id>",
+      "project_name": "<项目显示名>",
+      "text":         "<一句话原子事实>"
     },
     ...
   ],
@@ -725,90 +654,38 @@ _EXTRACT_FACTS_SYSTEM = """你是一名周报事实结构化助手。你的工�
 核心规则
 ────────────────────────────
 
-1. **原子化（critical）**
-   - 一条 "items" 项 = 一个独立可验证的事实。
-   - "完成 A，同时推进 B" 必须拆成 2 条。
-   - "做了一些优化" 这种聚合表述：作为 1 条保留模糊性，不要补具体内容。
-   - 流水账 / 心情 / 总结性套话（"本周整体推进顺利"）一律 **丢弃**，不进入 items。
+1. **原子化**
+   - 一条 "items" = 一个独立可验证的事实。
+   - "完成 A，同时推进 B" 拆成 2 条。
+   - 流水账 / 心情 / 总结性套话（"本周整体推进顺利"）丢弃。
 
-2. **项目标签（critical）**
-   - project_id 规范：纯小写英文/拼音 + 数字 + 下划线，无空格、无标点、无中文。
-       好：apollo, beacon_v2, oncall_q1
-       差：Apollo, beacon-v2, 阿波罗
-   - project_name 是人类可读的显示名（保留原文里的写法风格）。
-   - 同一项目的不同写法（"Apollo" / "阿波罗" / "APL-2026" / "阿波罗项目"）
-     必须映射到 **同一个 project_id**（如 "apollo"）。
-   - 不能归属到具体项目的事实（OKR 培训、修复内部工具 bug、参加 all-hands、
-     一次性的杂项支持等），统一用 project_id = "_misc"，project_name = "其他"。
-   - **不要为不存在的项目编造名字。** 原文模糊就用 _misc。
+2. **项目标签**
+   - project_id：纯小写英文/拼音 + 数字 + 下划线，无空格、无标点、无中文。
+       好：apollo, beacon_v2   差：Apollo, beacon-v2, 阿波罗
+   - project_name：纯人类可读名。**严禁**包含 project_id、英文 id 后缀、括号技术注释。
+       ✓ "AI 周报工具"、"订单系统"
+       ✗ "AI周报工具（robot）"、"订单系统 (order_system)"
+   - 同一项目的不同写法（"Apollo"/"阿波罗"/"APL-2026"）映射到同一 project_id。
+   - 无法归属到具体项目的（培训、内部 bug、all-hands 等）用 project_id="_misc"，project_name="其他"。
 
-3. **类别标签（恰好一个）**
-   - kpi: 已经完成的事，最好带量化结果。
-       "完成 X 上线，覆盖 30% 用户"  →  kpi
-       "修复 PROD-1234 缺陷"          →  kpi
+3. **类别标签**
+   - kpi: 已完成的事，最好带量化结果。
    - projects: 仍在推进、未闭环的里程碑。
-       "X 模块已完成开发，下周开始 QA"  →  projects
-       "Y 项目正在联调，预计周五出包"   →  projects
-   - risks: 当前仍影响进度的阻塞 / 跨组依赖 / 质量风险 / 上线风险。
-       "Z 监控未对齐，发布前需要 SRE 介入"   →  risks
-       "依赖 A 团队接口未交付，B 项目延期"   →  risks
-   - next_week: 明确的下周动作（**只能**来自原文里 "下周/下一步/计划" 等表述）。
-       "下周完成 X 的全量发布"           →  next_week
-       "继续推进 Y"（来自下周计划段落）  →  next_week
+   - risks: 仍影响进度的阻塞 / 跨组依赖 / 质量 / 上线风险。
+   - next_week: 原文里 "下周/下一步/计划" 等明确表述的动作。
 
-4. **report_worthy 字段（critical — 过滤"周报"与"技术讨论记录"）**
+4. **事实保真（HARD）**
+   - 数字、百分比、JIRA / 缺陷号、版本号、服务名、模块名、日期 — **逐字保留**。
+   - 不补原文没出现的影响 / 因果 / 结论。
+   - 原文写 "做了一些优化" 就保留原话，不要扩展。
 
-   这是部门周报，不是个人工作日志。判断每条 item 是否值得让部门负责人看到：
-
-   **report_worthy = true** 当且仅当满足以下任意一条：
-   - 有可衡量的结果 / 量化数据 / 明确的产出（"上线 X"、"修复 P0"、"减少 30% 延迟"）
-   - 有明确的下周动作（必须是 next_week 类别且原文写明）
-   - 是会影响项目进度 / 质量 / 上线 / 跨组协作的阻塞（不是个人技术疑问）
-   - 即使无量化，但是项目级别的里程碑状态（"模块开发完成，下周 QA"）
-
-   **report_worthy = false（这些是"技术讨论 / 流水账"，不进周报）：**
-   - 讨论 / 闲聊 / 同步信息类：
-       "和 X 讨论了 Y" 而**无结论 / 决定**
-       "跟 X 聊了下 Z 的方案"
-       "和团队 sync 了项目状态"
-       "参与了 X 评审 / all-hands / 培训"
-   - 调研 / 学习 / 探索类，**无后续动作**：
-       "调研了 X 技术"（没写要不要用）
-       "看了下 Y 的源码"
-       "学习了 Z 框架"
-   - 个人技术债 / 日常维护，**无管理可见度**：
-       "重构了内部工具的 helper 函数"
-       "整理了 README"
-       "写了几个单测"
-   - 实验性 / debug 记录，**无定论**：
-       "试了三种实现，发现都不太行"
-       "查了一下日志，没看出问题"
-       "GPU 跑了一下 OOM 了"（除非影响了发布 / 客户）
-   - 流水账细节，**不影响项目状态**：
-       "Redis key 重新拆了一版"（个人 PR，无影响说明）→ false
-       "Redis key 重拆，QPS 提升 20%"（带结果）→ true
-
-   边界判断原则：
-   - **写不出"这件事让管理层应该关心什么"，就是 false。**
-   - 宁可错杀（false 略偏多）也不要把噪音放进周报。
-   - 即使原文写得很详细，如果没有结果 / 动作 / 阻塞 → false。
-
-5. **事实保真（HARD）**
-   - 数字、百分比、JIRA / 缺陷号、版本号、服务名、模块名、日期、时间点 — **逐字保留**。
-   - 不要把原文没出现的影响 / 因果 / 结论补进 text。
-   - 不要"合理化"模糊表述。原文写 "做了一些优化" 就保留 "做了一些优化"，不要扩展成 "做了性能优化"。
-   - 不要复述章节标题（不要在 text 里写 "本周完成了..."）。
-
-6. **质量标注**
+5. **质量标注**
    - quality_note 留空 ""，除非原文严重缺失（< 100 字 + 无具体动作 / 完全偏题 / 与工作无关）。
-   - 非空时 ≤15 字，例：「内容仅 1 句」「未提交具体进展」「与工作无关」。
+   - 非空时 ≤15 字，例："内容仅 1 句"、"未提交具体进展"、"与工作无关"。
 
-7. **不做的事情**
-   - 不要排序（按原文出现顺序输出即可，后续阶段会重排）。
-   - 不要去重（同一作者内的小重复也保留，下游 plan 阶段会处理）。
-   - 不要分组（plan 阶段按 project_id 分组，你只负责打标签）。
-   - 不要润色 text 的措辞。
-   - 不要漏 report_worthy 字段 — 每条 item 必须显式给出 true / false。"""
+6. **不做的事情**
+   - 不排序、不去重、不分组（plan 阶段处理）。
+   - 不润色措辞。"""
 
 
 def _build_extract_facts_prompt(name: str, raw_report: str) -> tuple[str, str]:
@@ -879,23 +756,11 @@ async def extract_employee_facts(
         pname = str(raw_item.get("project_name", "") or "").strip() or (
             "其他" if pid == "_misc" else pid
         )
-        # report_worthy: default True on missing field (be lenient on schema)
-        # but treat explicit False / falsy values as the model's intent to drop.
-        rw_raw = raw_item.get("report_worthy")
-        if rw_raw is None:
-            rw = True
-        elif isinstance(rw_raw, bool):
-            rw = rw_raw
-        elif isinstance(rw_raw, str):
-            rw = rw_raw.strip().lower() not in ("false", "0", "no", "")
-        else:
-            rw = bool(rw_raw)
         items.append({
-            "category":      cat,
-            "project_id":    pid,
-            "project_name":  pname,
-            "text":          text,
-            "report_worthy": rw,
+            "category":     cat,
+            "project_id":   pid,
+            "project_name": pname,
+            "text":         text,
         })
 
     return {
@@ -915,16 +780,13 @@ async def extract_employee_facts(
 # highlight selection ≈10%. Facts are inputs — preservation is a hard
 # constraint, not an attention cost.
 
-_PLAN_SYSTEM = """你是一名"部门周报规划官"。你的任务是把多名员工的【原子事实清单】合并、去重、按项目归类、按重要性排序、**改写成管理层可读的执行摘要**，产出一份【部门周报计划】（ReportPlan）的严格 JSON。
+_PLAN_SYSTEM = """你是一名"部门周报规划官"。把多名员工的【原子事实清单】合并、去重、按项目归类、按重要性排序，产出一份【部门周报计划】（ReportPlan）的严格 JSON。
 
 ────────────────────────────
 输入
 ────────────────────────────
 - dept_name, iso_week: 部门 + 周次
-- employees: list[EmployeeFacts]。每个 EmployeeFacts 包含：
-    name, items (list[FactItem], 每项有 category/project_id/project_name/text/report_worthy), quality_note
-  注：上游 extract 阶段已经把 report_worthy=false 的"流水账 / 讨论记录"过滤掉了，
-  但如果你看到 items 中仍有偏过程性的内容，请进一步丢弃。
+- employees: list[EmployeeFacts]，每个含 name + items(category/project_id/project_name/text) + quality_note
 - not_submitted: 本周未提交周报的成员姓名
 
 ────────────────────────────
@@ -932,126 +794,81 @@ _PLAN_SYSTEM = """你是一名"部门周报规划官"。你的任务是把多名
 ────────────────────────────
 严格 JSON。不要 markdown 代码块。无任何 JSON 外的文字。
 {
-  "cross_cutting_highlights": ["...", "..."],   // 本周最值得放报告顶部的 1-3 条（按重要性降序）
+  "cross_cutting_highlights": ["...", "..."],   // 1-3 条，按重要性降序
   "projects": [
     {
       "project_id":     "apollo",
-      "display_name":   "Apollo",
+      "display_name":   "Apollo",            // 纯人类可读名；严禁含 project_id 或 (xxx) 后缀
       "importance":     5,
       "kpi":            ["..."],
       "projects":       ["..."],
       "risks":          ["..."],
       "next_week":      ["..."],
-      "merged_aliases": []          // 其他被合并进来的 project_id
+      "merged_aliases": []                   // 其他被合并进来的 project_id
     },
-    ...                              // 按 importance 降序
+    ...                                      // 按 importance 降序
   ],
   "low_quality_members": [
     {"name": "王五", "reason": "周报仅 1 句话"}
   ]
 }
 
-注意：**没有 owners 字段**。本部门周报不展示个人归属——管理层关心的是项目状态，不是谁做了什么。
+注：**没有 owners 字段**。本部门周报不展示个人归属。
 
 ────────────────────────────
-核心工作（按优先级 → 注意力预算）
+核心工作
 ────────────────────────────
 
-1. **跨员工去重（critical, 30%）**
-   合并标准（强 → 弱）：
-   a. project_id 相同 + text 几乎相同 → 强合并：保留信息更完整的版本。
-   b. project_id 相同 + 同一目标 / 同一里程碑 → 中合并：合并为一句更完整的表述。
-   c. project_id 相同 + 时间窗口相近 + 描述相关 → 弱合并：信息不冲突就合并；冲突就写一条 risks「原始周报对 X 表述不一致」。
-   d. project_id 不同但其实是同一项目（"apollo" vs "apl_2026"）→ 合并到出现次数多的 id，把另一个加入 merged_aliases。
+1. **跨员工去重**
+   - project_id 相同 + 同一目标 → 合并为一句更完整的表述。
+   - project_id 不同但其实同项目 → 合并到出现次数多的 id，另一个加入 merged_aliases。
 
-2. **按项目分组（10%）**
-   - 所有 FactItem 按 project_id 聚合到一个 ProjectRollup。
-   - 同一项目下，按原 FactItem 的 category 切到 kpi / projects / risks / next_week。
-   - kpi 中已写"完成"的事项，不再在 projects 里重复。
+2. **按项目分组**
+   - FactItem 按 project_id 聚合到 ProjectRollup。
+   - 同一项目内按 category 切到 kpi / projects / risks / next_week。
+   - kpi 中"完成"的事项，不在 projects 里重复。
 
-3. **管理层摘要改写（critical, 30%）**
+3. **管理层摘要改写**
+   - 先讲结论 / 状态 / 影响，再讲细节。
+   - 数字 / 缩写词 / 服务名 / JIRA / 版本号 100% 保留原文。
+   - 不加 "我们 / 团队 / 本周" 这种主语 / 时间词（write 阶段会处理）。
+   - 不加 emoji（write 阶段按 style_profile 决定）。
+   - 不凭空补 "为后续奠定基础"、"持续推进"。
+   - 不把 "调研了 X" 扩展为 "完成 X 选型"。
 
-   每条 text 必须从"工程师日志风" → "管理层执行摘要风"。原则：
-   - **先讲结论 / 状态 / 影响，再讲细节。** 不要按流程顺序堆细节。
-   - **抽象层级要稳定**。整份报告所有 bullets 应在同一抽象层级（项目级 / 里程碑级），
-     不要混入实现细节（Redis key 拆分、helper 函数重构、单测补充等）。
-   - **粒度统一**：把同一项目下多条**实现细节**滚动合并成一条**里程碑表述**。
-     例：3 条 "Redis key 重拆 / 链路追踪补充 / 单测补充" → 合并为 "完成本周性能与可观测性优化（含 Redis 重构、链路追踪补充）"。
-   - **数字 / 缩写词 / 服务名 / JIRA / 版本号 必须 100% 保留原文写法。** 摘要可以重组句式，但事实不可改。
-   - 不要加 emoji（write 阶段会按 style_profile 决定）。
-   - 不要加"我们 / 团队 / 本周" 这种主语 / 时间词，write 阶段会处理。
-
-   **few-shot 示例（必须达到这个改写质量）：**
-
-   示例 A — 改写过程描述：
-     原文 text:  "测试了三种总结方案：全文直接总结、先按人总结再 merge、先项目聚类再总结，效果最好的是先按人总结再 merge，但 token 消耗也最高"
-     改写后:     "总结 pipeline 完成三种方案验证，'按人总结后 merge' 效果最佳，但 token 成本偏高，待优化"
-
-   示例 B — 改写实现细节 → 里程碑：
-     原文 text:  "Redis key 重新拆了一版"
-     原文 text:  "trace 这周补了一部分"
-     原文 text:  "调整了 chunk 策略，现在先按标题切"
-     合并后单条: "完成本周性能与可观测性优化（Redis 重构 + 链路追踪补充 + chunk 策略改为按标题切分）"
-
-   示例 C — 改写抽象状态：
-     原文 text:  "飞书 docx/wiki 读取基本通了，summarize pipeline 能跑"
-     原文 text:  "临时拿 regex 顶了一下"
-     合并后单条: "飞书 docx/wiki 读取与 summarize pipeline 已联调通过，标题分块当前 regex 兜底"
-
-   示例 D — 改写风险：
-     原文 text:  "库存重复扣减的问题还没彻底定位，怀疑不是单纯数据库事务，可能是 MQ 重复消费或幂等有问题"
-     改写后:     "库存重复扣减问题未定位，方向锁定在 MQ 重复消费 / 幂等，需要继续排查"
-
-   示例 E — 改写下周计划：
-     原文 text:  "订单系统继续扩灰度"
-     原文 text:  "查库存重复扣减"
-     原文 text:  "trace 补完整"
-     不要合并（next_week 多动作分开列）：
-       "继续扩大灰度发布范围"
-       "定位库存重复扣减根因"
-       "补全链路追踪接入"
-
-   **禁止的改写**：
-   - 不要凭空补"为后续奠定基础"、"持续推进相关工作"。
-   - 不要把"调研了 X"扩展为"完成 X 选型"（原文未说选型完成）。
-   - 不要加"已"、"完成"等强动作词，除非原文明示。
-   - 不要加感叹 / 评价（"效果显著"、"推进顺利"），除非原文明说。
-
-4. **importance 评分（20%）**
-   - 5 = 战略级 / 线上事件 / 高层关注（核心系统上线、客户级事故、跨部门重大对齐）
+4. **importance 评分**
+   - 5 = 战略级 / 线上事件 / 高层关注
    - 4 = 多人协作的主要项目（≥3 人涉及，或本周有明确里程碑达成）
-   - 3 = 单人推进但有实质性产出（一个独立项目的关键节点）
-   - 2 = 例行优化 / 文档 / 维护性工作 / 单条 next_week 但无 kpi
-   - 1 = 一次性提及、无后续、无具体动作 → **直接 drop，不进入输出**
-   - **_misc 项目永远归为 importance=2**（除非里面有线上事故级内容）
+   - 3 = 单人推进但有实质性产出
+   - 2 = 例行优化 / 文档 / 维护性工作
+   - 1 = 一次性提及、无后续 → **drop，不进入输出**
+   - _misc 永远归为 importance=2
 
-5. **cross_cutting_highlights 选择（10%）**
-   从最终 projects 列表中，挑 1-3 条本周最值得管理层先看到的事。已经是改写过的执行摘要句。
-   优先级：
-   - 线上 / 业务直接影响（"订单系统完成灰度 20%，P95 延迟下降"）
-   - 跨多个项目的趋势（"本周 3 个项目集中进入 QA"）
-   - 重要风险（"AI 周报工具因周报输入质量参差，整体进度面临风险"）
-   严禁：单条流水账、客套话、与项目无关的事项。
+5. **cross_cutting_highlights 选择**
+   报告顶部 1-3 行，**业务视角 / 战略状态 / 重大风险**优先。
+   - 加 ** 加粗最关键的项目名 / 数字 / 动作。
+   - 单条 15-60 字。
+   - 不堆砌技术细节、不写客套话。
 
 6. **low_quality_members 收集**
    - 来自 quality_note 非空的员工：照搬 reason。
    - 来自 not_submitted 名单：reason 写 "未提交"。
+   - **严禁** name 为空 / null / "None" / 占位符（如 "未知成员1"）的行——直接丢弃。
+   - 每条必须同时有非空 name + 非空 reason，缺一就 drop。
 
 ────────────────────────────
-事实保真（HARD — 不可违反）
+事实保真（HARD）
 ────────────────────────────
 - 数字、百分比、JIRA / 缺陷号、版本号、服务 / 模块名、日期 100% 逐字保留。
-- 改写后内容必须是输入 FactItem.text 的等价信息——可以**合并 / 缩短 / 重组句式 / 抽象**，
-  但**不能新增事实、不能补输入里不存在的结论 / 影响**。
-- project_id 不能创造，只能来自输入 FactItem 或通过 merged_aliases 合并。
-- next_week 不能"补建议"。原文没说要做的事不写进 next_week。
+- project_id 不能创造，只能来自输入或通过 merged_aliases 合并。
+- next_week 不能"补建议"，原文没说就不写。
 - 不在 text 里出现员工姓名。
 
 ────────────────────────────
 输出规模
 ────────────────────────────
-- 最终 projects 数组通常 3-6 个。超过 6 个说明 importance≤2 的项目漏 drop 了，或者粒度合并不到位。
-- 每个 ProjectRollup 的 kpi/projects/risks/next_week 通常各 ≤3 条，超过应继续合并（除 next_week 多动作除外）。
+- projects 通常 3-6 个。
+- 每个 ProjectRollup 的 kpi/projects/risks/next_week 通常各 ≤3 条。
 - cross_cutting_highlights 严格 1-3 条。
 
 不要解释，直接输出 JSON。"""
@@ -1086,33 +903,11 @@ async def plan_report(
 ) -> ReportPlan:
     """[STAGE B] Build a ReportPlan from per-employee FactItems.
 
-    Pre-filters report_worthy=False FactItems in code before sending to the
-    LLM — first line of defense against process noise / discussion logs
-    polluting the plan. The extract prompt is meant to mark those False,
-    but enforcing in code too means the LLM only sees plan-worthy material
-    and spends all its attention on dedup / compression / ranking.
-
     On parse failure, returns an empty plan with all employees flagged as
     low_quality (so the manager sees the failure mode rather than a blank
     report).
     """
-    # Drop report_worthy=False items before serializing. Preserves
-    # quality_note + name so low_quality_members logic still works even
-    # if every item was filtered out.
-    filtered_facts: list[EmployeeFacts] = []
-    dropped_total = 0
-    for f in facts_list:
-        kept_items = [it for it in f["items"] if it.get("report_worthy", True)]
-        dropped_total += len(f["items"]) - len(kept_items)
-        filtered_facts.append({
-            "name":         f["name"],
-            "items":        kept_items,
-            "quality_note": f["quality_note"],
-        })
-    if dropped_total:
-        logger.info(f"[Plan] 预过滤 report_worthy=false: 共丢弃 {dropped_total} 条")
-
-    sys_p, usr_p = _build_plan_prompt(filtered_facts, dept_name, iso_week, not_submitted)
+    sys_p, usr_p = _build_plan_prompt(facts_list, dept_name, iso_week, not_submitted)
     empty: ReportPlan = {
         "cross_cutting_highlights": [],
         "projects":                 [],
@@ -1151,7 +946,16 @@ async def plan_report(
     def _str_list(v) -> list[str]:
         if not isinstance(v, list):
             return []
-        return [str(x).strip() for x in v if str(x).strip()]
+        out: list[str] = []
+        for x in v:
+            # Tolerate {severity,text} regressions by flattening to text only.
+            if isinstance(x, dict):
+                t = str(x.get("text", "") or "").strip()
+            else:
+                t = str(x).strip()
+            if t:
+                out.append(t)
+        return out
 
     projects_out: list[ProjectRollup] = []
     for p in parsed.get("projects", []) or []:
@@ -1176,17 +980,32 @@ async def plan_report(
     # Sort by importance descending (the model is asked to do this; enforce it)
     projects_out.sort(key=lambda x: -x["importance"])
 
+    # Filter low_quality_members aggressively — only keep entries that have
+    # BOTH a real name AND a real reason. The previous filter let JSON null,
+    # the literal string "None"/"null", and various placeholder names through,
+    # which produced rows like "周报质量待补充: None（返回格式异常）" in the
+    # final report. Two-axis filter: name must be human-meaningful AND reason
+    # must be non-empty.
+    _NAME_BLACKLIST = {"", "none", "null", "无", "未知", "未提供", "n/a", "na"}
     lqm_out: list[LowQualityMember] = []
     for lqm in parsed.get("low_quality_members", []) or []:
         if not isinstance(lqm, dict):
             continue
-        name = str(lqm.get("name", "")).strip()
-        if not name:
+        name_raw = lqm.get("name")
+        if name_raw is None:
             continue
-        lqm_out.append({
-            "name":   name,
-            "reason": str(lqm.get("reason", "") or "").strip() or "—",
-        })
+        name = str(name_raw).strip()
+        if not name or name.lower() in _NAME_BLACKLIST:
+            continue
+        # Drop "未知成员N" autoplaceholder that BitableService.split_records_per_employee
+        # uses when a record's 姓名 field is empty — those rows have no real
+        # signal to report on.
+        if re.fullmatch(r"未知成员\d*", name):
+            continue
+        reason = str(lqm.get("reason", "") or "").strip()
+        if not reason:
+            continue
+        lqm_out.append({"name": name, "reason": reason})
 
     plan: ReportPlan = {
         "cross_cutting_highlights": _str_list(parsed.get("cross_cutting_highlights"))[:3],
@@ -1211,7 +1030,7 @@ async def plan_report(
 # structure rendering ≈20%, compression ≈10%. Fact preservation is a
 # hard constraint enforced by the data flow.
 
-_WRITE_SYSTEM = """你是一名资深主管文笔助手。你的任务是把一份已经规划好的【ReportPlan JSON】渲染成 Markdown 部门周报，发给管理层阅读。
+_WRITE_SYSTEM = """你是一名资深主管文笔助手。把一份已规划好的【ReportPlan JSON】渲染成 Markdown 部门周报，发给管理层阅读。
 
 ────────────────────────────
 输入
@@ -1221,40 +1040,43 @@ _WRITE_SYSTEM = """你是一名资深主管文笔助手。你的任务是把一�
 - dept_name, iso_week, submitted, not_submitted: 上下文
 
 ────────────────────────────
-事实保真（HARD — 不可违反）
+事实保真（HARD）
 ────────────────────────────
-- plan 里的每一条 text 必须出现在最终报告中。可以合并 / 缩短 / 顺序调整，**绝不能新增、删除、替换事实**。
+- plan 里每一条 text 必须出现在最终报告中。可以合并 / 缩短 / 顺序调整，**不能新增 / 删除 / 替换事实**。
 - 数字、百分比、JIRA 号、版本号、服务名、日期 100% 逐字保留。
-- 不要补"持续推进"、"为后续打基础"、"赋能业务"这类填充语句。
-- 如果某个 ProjectRollup 的 risks 或 next_week 数组为空，那一段直接写 " - —"（破折号），不要编造内容。
-- **不要在正文或项目标题里出现任何员工姓名。** plan 中没有 owners 字段；本报告只关心项目状态，不展示个人归属。
+- 不补"持续推进"、"为后续打基础"、"赋能业务"这类填充语句。
+- 如果某个 ProjectRollup 的 risks 或 next_week 数组为空，那一段写 "- —"，不要编造内容。
+- **不在正文或项目标题里出现任何员工姓名**。plan 没有 owners 字段；本报告只关心项目状态。
 
 ────────────────────────────
-输出结构（严格按此输出）
+输出结构
 ────────────────────────────
 
 #### 🌟 本周高光
-{把 cross_cutting_highlights 每条写成一行，用 ** 加粗最关键的项目名 / 数字 / 动作}
+{cross_cutting_highlights 每条一行，用 ** 加粗最关键的项目名 / 数字 / 动作}
 
-{ 仅当 low_quality_members 非空 OR not_submitted 非空时，输出下面整个「说明」段；否则整段省略 }
+{ 仅当 low_quality_members 非空 OR not_submitted 非空时输出整个「说明」段；否则省略 }
 #### 📝 说明
-- 未提交：{not_submitted 加顿号连接；如为空跳过此行}
-- 周报质量待补充：{low_quality_members 加顿号连接，格式 "姓名（reason）"；如为空跳过此行}
+- 未提交：{not_submitted 顿号连接；如为空跳过此行}
+- 周报质量待补充：{low_quality_members 顿号连接，格式 "姓名（reason）"；如为空跳过此行}
 
 #### 📊 项目进展
 {按 plan.projects 顺序，每个项目一个 ### 子块；importance≤2 的项目放进最后的「其他事项」}
 
 ### {display_name}
-{**注意**：标题中**只有项目名**，不带"（负责人：...）"或任何人名标注}
+
+display_name 渲染前清洗：如果意外包含 (xxx) / （xxx）/ - xxx 之类的技术 id 后缀
+（如 "AI周报工具（robot）"），去掉括号及其内容，只保留 "AI周报工具"。
+标题里**只有项目名**，不带 "(负责人：...)" 等人名标注。
 
 **本周完成**
-{把 kpi 数组渲染成 "- xxx" bullets；如为空写 "- —"}
+{kpi 数组渲染成 "- xxx" bullets；如为空写 "- —"}
 
 **项目进展**
-{把 projects 数组渲染成 bullets；如为空写 "- —"；如该项目所有里程碑已在本周完成且无 in-flight 里程碑，整段省略}
+{projects 数组渲染成 bullets；如为空写 "- —"；如所有里程碑已完成且无 in-flight，整段省略}
 
 **风险与阻塞**
-{risks bullets；如为空写 "- —"}
+{risks 数组渲染成 bullets；如为空写 "- —"}
 
 **下周计划**
 {next_week bullets；如为空写 "- —"}
@@ -1268,36 +1090,28 @@ _WRITE_SYSTEM = """你是一名资深主管文笔助手。你的任务是把一�
 ────────────────────────────
 
 1. **bullet 写法**
-   - 一条 bullet 1-2 句话。先写结果 / 状态，再写影响 / 后续。
+   - 1-2 句话。先写结果 / 状态，再写影响 / 后续。
    - 主动语态，结果先行。"完成 X，提升 Y 至 Z%" 优于 "为了 Y，本周完成了 X"。
-   - 不要在 bullet 里重复 ### 项目标题。
+   - 不在 bullet 里重复 ### 项目标题。
 
-2. **章节标题里的 emoji**
-   - 默认按上方模板（🌟 📝 📊 🗒️）。
-   - 如果 style_profile.emoji_density == 0，去掉所有 emoji。
-   - 如果 style_profile.emoji_density > 0.5，可以在 bullet 行首适度加 ✅⚠️📌 等小图标。
-
-3. **style_profile 应用（如果 style_profile 提供）**
-   - sentence_length: short / medium / long → 控制每条 bullet 的句长。
-   - formality 1-5: 1=口语化, 3=正常职场, 5=正式书面。映射示例：
-       formality≥4 → 用 "已完成" 而非 "做完了"，用 "推进" 而非 "搞"
-       formality≤2 → 可以用更轻松的表述
-   - voice: "we" → 句首可用 "我们"；"team" → 用 "团队"；"neutral" → 不出现主语
-   - signature_phrases: 列表里的词 / 句式可以自然融入（不要堆砌）。
+2. **style_profile 应用**
+   - sentence_length: short / medium / long → 控制句长。
+   - formality 1-5: 1=口语化, 3=正常职场, 5=正式书面。
+   - voice: "we" → 用 "我们"；"team" → 用 "团队"；"neutral" → 不出现主语。
+   - signature_phrases: 可自然融入（不堆砌）。
    - banned_phrases: 列表里的词**绝对不出现**。常见全局禁用："总体来说"、"综上所述"、"首先其次最后"、"值得注意的是"、"为...奠定基础"、"赋能"、"抓手"、"保驾护航"。
-   - extras: 原文保留的额外指令，作为软约束遵守。
+   - emoji_density: 0=去掉章节标题 emoji；0.3-0.7=默认；>0.7=bullet 可加 ✅⚠️📌。
 
-4. **如果 style_profile 为空**
-   - 默认 formality=3, voice=neutral, emoji_density=0.3。
-   - 默认 banned_phrases = 上面常见全局禁用列表。
+3. **style_profile 为空时**
+   默认 formality=3, voice=neutral, emoji_density=0.3, 默认禁用上述全局列表。
 
 ────────────────────────────
-自检（输出前必须满足）
+自检
 ────────────────────────────
 - 每个 importance≥3 的 ProjectRollup 是否独立成块？✓
-- cross_cutting_highlights 是否都出现在「本周高光」段？✓
-- 输出中是否有任何事实**不在** plan 里？必须 ✗
-- 是否有空段被填充了套话？必须 ✗
+- 正文是否完全不出现员工姓名？✓
+- 输出是否有任何事实不在 plan 里？必须 ✗
+- 是否有空段被填充套话？必须 ✗
 
 直接输出 Markdown，不要解释，不要 ```代码块```。"""
 

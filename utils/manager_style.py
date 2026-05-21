@@ -361,7 +361,27 @@ async def save_manager_style(
     """
     # Never trust raw form_value — filter tags to the known catalog so a
     # stale card option doesn't silently inject a junk tag into the prompt.
-    cleaned_tags = [t for t in (tone_tags or []) if t in STYLE_TAG_CATALOG]
+    # Filter against the catalog. Loud warning if everything got rejected —
+    # most common cause: the Feishu card builder is sending option `value`
+    # strings that don't exactly match STYLE_TAG_CATALOG entries (e.g. the
+    # value is in English while the catalog is in Chinese, or there's a
+    # trailing space). When the warning fires, check what raw input shape
+    # the save action handler logged vs. STYLE_TAG_CATALOG.
+    incoming = list(tone_tags or [])
+    cleaned_tags = [t for t in incoming if t in STYLE_TAG_CATALOG]
+    if incoming and not cleaned_tags:
+        rejected_preview = ", ".join(repr(t) for t in incoming[:5])
+        logger.warning(
+            f"[ManagerStyle] tone_tags 全部被目录过滤掉 — 卡片可能在发送 option "
+            f"value 而不是目录中的中文标签。被拒绝: {rejected_preview} | "
+            f"目录: {STYLE_TAG_CATALOG}"
+        )
+    elif incoming and len(cleaned_tags) < len(incoming):
+        rejected = [t for t in incoming if t not in STYLE_TAG_CATALOG]
+        logger.warning(
+            f"[ManagerStyle] 部分 tone_tags 被过滤: 保留 {cleaned_tags}, "
+            f"丢弃 {rejected}"
+        )
     now = datetime.now(timezone(timedelta(hours=8))).strftime("%Y-%m-%d %H:%M")
 
     profile: dict = {
