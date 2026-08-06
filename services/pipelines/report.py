@@ -88,11 +88,7 @@ class ReportPipelines(PipelineBase):
 
         try:
             # ── Resolve folder ────────────────────────────────────────────────
-            org_tree = await self.contact_service.get_cached_org_tree()
-            managed = [
-                e for e in org_tree
-                if e.get("manager") and e["manager"].open_id == open_id
-            ]
+            managed = await self.contact_service.get_managed_depts(open_id)
             if not managed:
                 logger.warning(f"[Generate] 未找到管理的部门: open_id={open_id}")
                 return
@@ -260,7 +256,7 @@ class ReportPipelines(PipelineBase):
             # Patch the in-place generating card → action card (rewrite/submit).
             # Fall back to a DM only if there's no message_id to patch.
             if message_id:
-                await self.card_service.send_generated_success_card(message_id)
+                await self.card_service.send_generated_success_card(open_id, message_id)
             else:
                 await self.card_service.send_summary_action_card(open_id)
             logger.info(f"[Generate] 周报总结生成完成: dept={dept_name}")
@@ -458,7 +454,7 @@ class ReportPipelines(PipelineBase):
                 return
 
             await LarkMessageEvent._send_im_message(
-                self.lark_api,
+                self.card_service.get_lark_api(open_id),
                 content=json.dumps(
                     {"text": f"✅ 周报总结已写入【{dept_name}】{target_desc}。"},
                     ensure_ascii=False,

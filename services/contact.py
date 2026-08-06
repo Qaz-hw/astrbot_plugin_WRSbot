@@ -15,6 +15,8 @@
 
 import asyncio
 import datetime
+import os
+from types import SimpleNamespace
 
 from lark_oapi.api.contact.v3 import (
     ListDepartmentRequest,
@@ -29,46 +31,167 @@ _CACHE_REFRESH_INTERVAL = 5 * 60 * 60  # 5 hours in seconds
 class ContactService:
     def __init__(self, lark_api):
         self.lark_api = lark_api
-        self._org_tree_cache: list[dict] | None = None
-        self._leader_ids: frozenset[str] = frozenset()
+        # Contact data and open_ids are scoped to a Lark app.  Keep an
+        # independent cache per adapter instead of sharing the first adapter's
+        # organization tree with every app in this AstrBot process.
+        self._lark_api_by_open_id: dict[str, object] = {}
+        self._org_tree_cache_by_api: dict[int, list[dict]] = {}
+        self._leader_ids_by_api: dict[int, frozenset[str]] = {}
+        # Temporary local override for functional testing.  Lark delivers an
+        # app-scoped open_id rather than a reliable display name in events.
+        self._test_admin_open_ids = frozenset(
+            open_id.strip()
+            for open_id in os.getenv("WRSBOT_TEST_ADMIN_OPEN_IDS", "").split(",")
+            if open_id.strip()
+        )
         self._cache_lock = asyncio.Lock()
         self._refresh_task: asyncio.Task | None = None
 
+    def bind_lark_api(self, open_id: str, lark_api, *, schedule_refresh: bool = True) -> None:
+        """Remember which Lark app owns an inbound user's app-scoped open_id."""
+        if open_id and lark_api:
+            self._lark_api_by_open_id[open_id] = lark_api
+            # The first event from a newly seen app must populate that app's
+            # cache before role/folder logic can safely use it.
+            if schedule_refresh and self._api_key(lark_api) not in self._org_tree_cache_by_api:
+                try:
+                    asyncio.get_running_loop().create_task(
+                        self._do_refresh(open_id, lark_api=lark_api)
+                    )
+                except RuntimeError:
+                    # No loop during construction; start_cache handles the
+                    # startup/default adapter in that case.
+                    pass
+
+    def _resolve_lark_api(self, open_id: str = "", lark_api=None):
+        return lark_api or self._lark_api_by_open_id.get(open_id) or self.lark_api
+
+    @staticmethod
+    def _api_key(lark_api) -> int:
+        return id(lark_api)
+
+    def get_cached_org_tree_sync(self, open_id: str = "", lark_api=None) -> list[dict]:
+        """Synchronous cache read for card-action handlers."""
+        api = self._resolve_lark_api(open_id, lark_api)
+        return self._org_tree_cache_by_api.get(self._api_key(api), [])
+
     def is_manager(self, open_id: str) -> bool:
         """Synchronous role check — safe to call from card action handlers."""
-        return open_id in self._leader_ids
+        api = self._resolve_lark_api(open_id)
+        leaders = self._leader_ids_by_api.get(self._api_key(api), frozenset())
+        return open_id in leaders or open_id in self._test_admin_open_ids
+
+    def is_test_admin(self, open_id: str) -> bool:
+        """Whether the explicit local functional-test override grants this role."""
+        return open_id in self._test_admin_open_ids
+
+    def _managed_depts_from_tree(self, open_id: str, org_tree: list[dict]) -> list[dict]:
+        managed = [
+            entry for entry in org_tree
+            if entry.get("manager") and entry["manager"].open_id == open_id
+        ]
+        if managed or open_id not in self._test_admin_open_ids:
+            return managed
+
+        # Temporary functional-test route: use the test user's actual Feishu
+        # membership department as their manager context.  This keeps the
+        # folder binding, management dashboard, and submission-card member
+        # list aligned.  Real department leaders always use the branch above.
+        member_dept = next(
+            (
+                entry for entry in org_tree
+                if any(
+                    getattr(member, "open_id", None) == open_id
+                    for member in entry.get("members", [])
+                )
+            ),
+            None,
+        )
+        if member_dept:
+            dept = member_dept["dept"]
+            logger.warning(
+                f"[Contact] 临时测试管理员使用成员部门作为管理上下文: "
+                f"open_id={open_id} dept={dept.name or ''} "
+                f"open_dept_id={getattr(dept, 'open_department_id', '') or ''}"
+            )
+            return [member_dept]
+
+        # If membership data is unavailable, retain the old fallback so the
+        # test route remains usable while the contact cache is incomplete.
+        root = next(
+            (entry for entry in org_tree
+             if getattr(entry.get("dept"), "open_department_id", "") == "0"),
+            None,
+        )
+        return [root] if root else org_tree[:1]
+
+    def get_managed_depts_sync(self, open_id: str) -> list[dict]:
+        """Synchronous role/dept lookup for card callback handlers."""
+        return self._managed_depts_from_tree(open_id, self.get_cached_org_tree_sync(open_id))
+
+    async def get_managed_depts(self, open_id: str) -> list[dict]:
+        """Return actual leader departments, with the explicit test fallback."""
+        return self._managed_depts_from_tree(
+            open_id, await self.get_cached_org_tree(open_id)
+        )
 
     # ── API wrappers ─────────────────────────────────────────────────────────
 
-    async def list_root_departments(self) -> list:
-        """List all root-level departments. Returns list of department objects."""
-        req = (
-            ListDepartmentRequest.builder()
-            .parent_department_id("0")
-            .user_id_type("open_id")
-            .page_size(50)
-            .build()
-        )
-        resp = await self.lark_api.contact.v3.department.alist(req)
-        if not resp.success():
-            raise RuntimeError(f"code={resp.code} msg={resp.msg}")
-        return resp.data.items or []
+    async def list_root_departments(self, *, lark_api=None) -> list:
+        """List every department below the organization root.
 
-    async def list_department_members(self, open_department_id: str) -> list:
-        """List all members in a department. Returns list of user objects."""
-        req = (
-            ListUserRequest.builder()
-            .department_id(open_department_id)
-            .user_id_type("open_id")
-            .page_size(50)
-            .build()
-        )
-        resp = await self.lark_api.contact.v3.user.alist(req)
-        if not resp.success():
-            raise RuntimeError(f"code={resp.code} msg={resp.msg}")
-        return resp.data.items or []
+        ``fetch_child=True`` asks Feishu to recurse through nested
+        departments.  The former implementation only returned the root's
+        immediate children, so employees in a nested department were missed.
+        """
+        departments = []
+        page_token = None
+        while True:
+            builder = (
+                ListDepartmentRequest.builder()
+                .parent_department_id("0")
+                .fetch_child(True)
+                .user_id_type("open_id")
+                .page_size(50)
+            )
+            if page_token:
+                builder.page_token(page_token)
+            api = self._resolve_lark_api(lark_api=lark_api)
+            resp = await api.contact.v3.department.alist(builder.build())
+            if not resp.success():
+                raise RuntimeError(f"code={resp.code} msg={resp.msg}")
+            departments.extend(resp.data.items or [])
+            if not getattr(resp.data, "has_more", False):
+                return departments
+            page_token = getattr(resp.data, "page_token", None)
+            if not page_token:
+                return departments
 
-    async def get_user(self, open_id: str):
+    async def list_department_members(self, open_department_id: str, *, lark_api=None) -> list:
+        """List every direct member in a department, across all pages."""
+        members = []
+        page_token = None
+        while True:
+            builder = (
+                ListUserRequest.builder()
+                .department_id(open_department_id)
+                .user_id_type("open_id")
+                .page_size(50)
+            )
+            if page_token:
+                builder.page_token(page_token)
+            api = self._resolve_lark_api(lark_api=lark_api)
+            resp = await api.contact.v3.user.alist(builder.build())
+            if not resp.success():
+                raise RuntimeError(f"code={resp.code} msg={resp.msg}")
+            members.extend(resp.data.items or [])
+            if not getattr(resp.data, "has_more", False):
+                return members
+            page_token = getattr(resp.data, "page_token", None)
+            if not page_token:
+                return members
+
+    async def get_user(self, open_id: str, *, lark_api=None):
         """Fetch a single user profile by open_id. Returns user object or None."""
         req = (
             GetUserRequest.builder()
@@ -76,19 +199,20 @@ class ContactService:
             .user_id_type("open_id")
             .build()
         )
-        resp = await self.lark_api.contact.v3.user.aget(req)
+        api = self._resolve_lark_api(open_id, lark_api)
+        resp = await api.contact.v3.user.aget(req)
         if not resp.success() or not resp.data or not resp.data.user:
             return None
         return resp.data.user
  
     
-    async def get_user_profile_dump(self, open_id: str) -> str:
+    async def get_user_profile_dump(self, open_id: str, *, lark_api=None) -> str:
         """Fetch user by open_id and return a formatted profile string for display.
 
         Always returns a string — never raises. Errors are embedded in the output.
         """
         try:
-            user = await self.get_user(open_id)
+            user = await self.get_user(open_id, lark_api=lark_api)
         except Exception as e:
             return f"获取用户失败: {e}"
         if not user:
@@ -181,18 +305,21 @@ class ContactService:
 
     # ── Org tree cache ───────────────────────────────────────────────────────
 
-    async def get_cached_org_tree(self) -> list[dict]:
+    async def get_cached_org_tree(self, open_id: str = "", *, lark_api=None) -> list[dict]:
         """Return the cached org tree. Blocks if a refresh is in progress."""
         async with self._cache_lock:
-            if self._org_tree_cache is None:
+            api = self._resolve_lark_api(open_id, lark_api)
+            cached = self._org_tree_cache_by_api.get(self._api_key(api))
+            if cached is None:
                 raise RuntimeError("Org tree cache not initialized yet")
-            return self._org_tree_cache
+            return cached
 
-    async def _do_refresh(self) -> None:
+    async def _do_refresh(self, open_id: str = "", *, lark_api=None) -> None:
         """Fetch a fresh org tree and replace the cache under the lock."""
         logger.info("[Contact] 开始刷新部门缓存...")
+        api = self._resolve_lark_api(open_id, lark_api)
         try:
-            fresh = await self.get_org_tree()
+            fresh = await self.get_org_tree(lark_api=api)
         except Exception as e:
             logger.error(f"[Contact] 部门缓存刷新失败: {e}")
             return
@@ -202,8 +329,9 @@ class ContactService:
             if e["manager"] and e["manager"].open_id
         )
         async with self._cache_lock:
-            self._org_tree_cache = fresh
-            self._leader_ids = leader_ids
+            key = self._api_key(api)
+            self._org_tree_cache_by_api[key] = fresh
+            self._leader_ids_by_api[key] = leader_ids
         dept_count   = len(fresh)
         member_count = sum(len(e["members"]) for e in fresh)
         logger.info(
@@ -215,15 +343,30 @@ class ContactService:
         """Background task: refresh org tree every _CACHE_REFRESH_INTERVAL seconds."""
         while True:
             await asyncio.sleep(_CACHE_REFRESH_INTERVAL)
-            await self._do_refresh()
+            apis = {id(self.lark_api): self.lark_api}
+            apis.update({id(api): api for api in self._lark_api_by_open_id.values()})
+            for api in apis.values():
+                await self._do_refresh(lark_api=api)
 
-    async def start_cache(self) -> None:
-        """Initial load + launch background refresh loop. Call from plugin initialize()."""
-        await self._do_refresh()
+    async def start_cache(self, lark_apis: list | None = None) -> None:
+        """Launch the refresh loop and warm each configured Lark adapter.
+
+        Each adapter has an app/tenant-scoped contact directory.  Warming the
+        complete platform-adapter list uses the same adapter-specific refresh
+        path as an inbound Feishu event, without guessing which adapter the
+        first user will use after a restart.
+        """
         self._refresh_task = asyncio.create_task(self._refresh_loop())
+        api_source = [self.lark_api] if lark_apis is None else lark_apis
+        startup_apis = list({id(api): api for api in api_source if api}.values())
         logger.info(
-            f"[Contact] 后台缓存刷新任务已启动（间隔 {_CACHE_REFRESH_INTERVAL // 3600} 小时）"
+            f"[Contact] 后台缓存刷新任务已启动（间隔 {_CACHE_REFRESH_INTERVAL // 3600} 小时），正在预热 {len(startup_apis)} 个飞书应用通讯录缓存"
         )
+        # Do not block plugin startup on complete organization-directory
+        # scans. _do_refresh handles API failures and only publishes a
+        # complete result to each adapter's cache.
+        for api in startup_apis:
+            asyncio.create_task(self._do_refresh(lark_api=api))
 
     def stop_cache(self) -> None:
         """Cancel the background refresh task. Call from plugin terminate()."""
@@ -233,8 +376,8 @@ class ContactService:
 
     # ── Composite queries ────────────────────────────────────────────────────
 
-    async def get_org_tree(self) -> list[dict]:
-        """Return structured org tree for all root departments.
+    async def get_org_tree(self, *, lark_api=None) -> list[dict]:
+        """Return structured data for every department in the organization.
 
         Each entry: {dept, manager, members}
           dept    — department object
@@ -243,14 +386,15 @@ class ContactService:
 
         Per-department member/manager errors are logged and skipped.
         """
-        departments = await self.list_root_departments()
+        api = self._resolve_lark_api(lark_api=lark_api)
+        departments = await self.list_root_departments(lark_api=api)
         result = []
         for dept in departments:
             open_dept_id = getattr(dept, "open_department_id", "") or ""
             leader_open_id = getattr(dept, "leader_user_id", "") or ""
 
             try:
-                members = await self.list_department_members(open_dept_id)
+                members = await self.list_department_members(open_dept_id, lark_api=api)
             except Exception as e:
                 logger.warning(f"[Contact] 获取部门成员失败 {dept.name}: {e}")
                 members = []
@@ -258,27 +402,51 @@ class ContactService:
             manager = None
             if leader_open_id:
                 try:
-                    manager = await self.get_user(leader_open_id)
+                    manager = await self.get_user(leader_open_id, lark_api=api)
                 except Exception:
                     pass
 
             result.append({"dept": dept, "manager": manager, "members": members})
+
+        # Users can be assigned directly to the organization root instead of a
+        # named department.  Preserve them in the same entry shape so employee
+        # views can still locate them.
+        try:
+            root_members = await self.list_department_members("0", lark_api=api)
+        except Exception as e:
+            logger.warning(f"[Contact] 获取根部门成员失败: {e}")
+            root_members = []
+        if root_members:
+            result.append(
+                {
+                    "dept": SimpleNamespace(
+                        department_id="0",
+                        open_department_id="0",
+                        name="根部门",
+                        member_count=len(root_members),
+                        leader_user_id="",
+                    ),
+                    "manager": None,
+                    "members": root_members,
+                }
+            )
         return result
 
-    async def list_all_members(self) -> tuple[list[dict], list[str]]:
+    async def list_all_members(self, *, lark_api=None) -> tuple[list[dict], list[str]]:
         """Return (contacts, errors) — flat deduped member list across all root departments.
 
         contacts: [{name, job_title, open_id}]
         errors:   per-department failure messages (non-fatal)
         """
-        departments = await self.list_root_departments()
+        api = self._resolve_lark_api(lark_api=lark_api)
+        departments = await self.list_root_departments(lark_api=api)
         seen = set()
         contacts = []
         errors = []
         for dept in departments:
             open_dept_id = getattr(dept, "open_department_id", "") or ""
             try:
-                members = await self.list_department_members(open_dept_id)
+                members = await self.list_department_members(open_dept_id, lark_api=api)
             except Exception as e:
                 errors.append(f"部门「{dept.name}」获取成员失败: {e}")
                 continue
@@ -291,4 +459,3 @@ class ContactService:
                         "open_id": u.open_id,
                     })
         return contacts, errors
-

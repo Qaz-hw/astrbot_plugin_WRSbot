@@ -50,11 +50,7 @@ class ViewsPipelines(PipelineBase):
         from ...utils.env_config import get_dept_folder_token
 
         try:
-            org_tree = await self.contact_service.get_cached_org_tree()
-            managed = [
-                e for e in org_tree
-                if e.get("manager") and e["manager"].open_id == open_id
-            ]
+            managed = await self.contact_service.get_managed_depts(open_id)
             if not managed:
                 logger.warning(f"[AdminView] 未找到管理的部门: open_id={open_id}")
                 await self._dm_text(
@@ -175,7 +171,7 @@ class ViewsPipelines(PipelineBase):
         from ...utils.env_config import get_dept_folder_token
 
         try:
-            org_tree = await self.contact_service.get_cached_org_tree()
+            org_tree = await self.contact_service.get_cached_org_tree(open_id)
 
             dept_entry = None
             for entry in org_tree:
@@ -282,11 +278,7 @@ class ViewsPipelines(PipelineBase):
         from ...utils.env_config import get_dept_folder_token
 
         try:
-            org_tree = await self.contact_service.get_cached_org_tree()
-            managed = [
-                e for e in org_tree
-                if e.get("manager") and e["manager"].open_id == open_id
-            ]
+            managed = await self.contact_service.get_managed_depts(open_id)
             if not managed:
                 logger.warning(f"[Reminder] 未找到管理的部门: open_id={open_id}")
                 return
@@ -354,6 +346,9 @@ class ViewsPipelines(PipelineBase):
             sent = 0
             for m in result.get("members", []):
                 if m.get("name") in not_submitted and m.get("open_id"):
+                    self.card_service.bind_lark_api(
+                        m["open_id"], self.card_service.get_lark_api(open_id)
+                    )
                     await self.card_service.send_user_view_card(
                         m["open_id"], dept_name, is_submitted=False
                     )
@@ -380,13 +375,14 @@ class ViewsPipelines(PipelineBase):
         Triggered by:
             - view_doc card action (button on user / admin view cards)
         """
-        if not self.lark_api:
+        api = self.card_service.get_lark_api(open_id)
+        if not api:
             return
         from astrbot.core.platform.sources.lark.lark_event import LarkMessageEvent
         try:
             reply = await self._build_writing_folder_reply(open_id)
             await LarkMessageEvent._send_im_message(
-                self.lark_api,
+                api,
                 content=json.dumps({"text": reply}, ensure_ascii=False),
                 msg_type="text",
                 receive_id=open_id,

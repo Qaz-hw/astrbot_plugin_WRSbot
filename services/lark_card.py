@@ -30,6 +30,7 @@ if TYPE_CHECKING:
     from .contact import ContactService
 
 from astrbot.api import logger
+from .lark_context import set_active_lark_api
 from lark_oapi.event.callback.model.p2_card_action_trigger import (
     P2CardActionTrigger,
     P2CardActionTriggerResponse,
@@ -39,23 +40,23 @@ from lark_oapi.event.callback.processor import P2CardActionTriggerProcessor
 # ──Connection Testing cards template IDs ────────────────────────────────────────────────────────
 # Set via environment variables. Default values are test card IDs.
 # Create cards in Feishu card builder and update these IDs before production.
-WELCOME_CARD_ID = os.getenv("WELCOME_CARD_ID", "AAqtuTe2kNZbb")
+WELCOME_CARD_ID = os.getenv("WRSBOT_WELCOME_CARD_ID", "AAqWG7tpchJNE")
 ALERT_CARD_ID = os.getenv("ALERT_CARD_ID", "AAqtuTeNqRxte")
 ALERT_RESOLVED_CARD_ID = os.getenv("ALERT_RESOLVED_CARD_ID", "AAqtuTeLM56jm")
 
 # ──WRSbot cards template IDs ────────────────────────────────────────────────────────
 # Set via environment variables. Default values are test card IDs.
-WRSBOT_WELCOME_CARD_ID = os.getenv("WRSBOT_WELCOME_CARD_ID", "AAqtqD3jefquF")
-WRSBOT_COMMAND_LIST_ID = os.getenv("WRSBOT_COMMAND_LIST_ID", "AAqtjqFzhM57P")
+WRSBOT_WELCOME_CARD_ID = os.getenv("WRSBOT_WELCOME_CARD_ID", "AAqWG7tpchJNE")
+WRSBOT_COMMAND_LIST_ID = os.getenv("WRSBOT_COMMAND_LIST_ID", "AAqWG7LYdWWZ8")
 
-WRSBOT_BINDFOLDER_TUTORIAL_CARD_ID = os.getenv("WRSBOT_BINDFOLDER_TUTORIAL_CARD_ID", "AAqt8pubhP0Br")
+WRSBOT_BINDFOLDER_TUTORIAL_CARD_ID = os.getenv("WRSBOT_BINDFOLDER_TUTORIAL_CARD_ID", "AAqWGzF0skSTw")
 WRSBOT_BINDING_FEEDBACK_SUCCESS_CARD_ID = os.getenv("WRSBOT_BINDING_FEEDBACK_SUCCESS_CARD_ID", "AAqtVxQCOa3D8")
-WRSBOT_NOT_BINDiNG_FEEDBACK_CARD_ID = os.getenv("WRSBOT_NOT_BINDiNG_FEEDBACK_CARD_ID", "AAqtwzfERE7gi")
-WRSBOT_ADMIN_VIEW_CARD_ID = os.getenv("WRSBOT_ADMIN_VIEW_CARD_ID", "AAqtVhgEFc7gG")
+WRSBOT_NOT_BINDiNG_FEEDBACK_CARD_ID = os.getenv("WRSBOT_NOT_BINDiNG_FEEDBACK_CARD_ID", "AAqWGzef64dV3")
+WRSBOT_ADMIN_VIEW_CARD_ID = os.getenv("WRSBOT_ADMIN_VIEW_CARD_ID", "AAqWGzpYUSdDc")
 WRSBOT_ADMIN_REPORT_SUMMARY_CHECK_CARD_ID = os.getenv("WRSBOT_ADMIN_REPORT_SUMMARY_CHECK_CARD_ID", "AAqtVXND6ex3t") #Report Submission check. triggered when starting weekly report summary when not everyone in the department is submitted their report 
-WRSBOT_CARD_USER_VIEW_ID = os.getenv("WRSBOT_CARD_USER_VIEW_ID", "AAqtDwcOM8ogx")
-WRSBOT_SUMMARY_REWRITE_CARD_ID = os.getenv("WRSBOT_SUMMARY_REWRITE_CARD_ID", "AAqtF6JbQ9ZBu")
-WRSBOT_STYLE_CONFIG_CARD_ID = os.getenv("WRSBOT_STYLE_CONFIG_CARD_ID", "AAqtBTDTqvzR4")
+WRSBOT_CARD_USER_VIEW_ID = os.getenv("WRSBOT_CARD_USER_VIEW_ID", "AAqWGzJx4vkWm")
+WRSBOT_SUMMARY_REWRITE_CARD_ID = os.getenv("WRSBOT_SUMMARY_REWRITE_CARD_ID", "AAqWGzI8irmU6")
+WRSBOT_STYLE_CONFIG_CARD_ID = os.getenv("WRSBOT_STYLE_CONFIG_CARD_ID", "AAqWGzaxnlUyj")
 
 
 
@@ -63,6 +64,11 @@ WRSBOT_STYLE_CONFIG_CARD_ID = os.getenv("WRSBOT_STYLE_CONFIG_CARD_ID", "AAqtBTDT
 class LarkCardService:
     def __init__(self, lark_api):
         self.lark_api = lark_api
+        # An AstrBot process can host more than one Lark app.  open_ids are
+        # app-scoped, so never assume the first startup adapter owns a later
+        # inbound event.  Record the adapter that actually received each user.
+        self._lark_api_by_open_id: dict[str, object] = {}
+        self._lark_api_by_streaming_card_id: dict[str, object] = {}
         self.contact_service: "ContactService | None" = None
         self._admin_pipeline_fn    = None
         self._user_pipeline_fn     = None
@@ -73,6 +79,15 @@ class LarkCardService:
         self._open_style_config_fn = None
         self._save_style_fn        = None
         self._view_doc_fn          = None
+
+    def bind_lark_api(self, open_id: str, lark_api) -> None:
+        """Associate an app-scoped user ID with the adapter that received it."""
+        if open_id and lark_api:
+            self._lark_api_by_open_id[open_id] = lark_api
+
+    def get_lark_api(self, open_id: str = "", lark_api=None):
+        """Return the explicitly supplied or event-owned Lark API client."""
+        return lark_api or self._lark_api_by_open_id.get(open_id) or self.lark_api
 
     def set_user_pipeline(self, fn) -> None:
         """Signature: async fn(open_id: str) -> None"""
@@ -130,17 +145,32 @@ class LarkCardService:
         if not get_insts:
             return
         for platform in get_insts():
-            if hasattr(platform, "event_handler") and hasattr(
+            if hasattr(platform, "lark_api") and hasattr(platform, "event_handler") and hasattr(
                 platform.event_handler, "_callback_processor_map"
             ):
+                # Bind this processor to the same adapter that owns this
+                # websocket connection.  A card callback has no AstrBot event
+                # object, so this closure is the only reliable source client.
+                processor = P2CardActionTriggerProcessor(
+                    lambda data, api=platform.lark_api: self.handle_card_action_sync(
+                        data, lark_api=api
+                    )
+                )
+                # lark-oapi has used both names across callback transport / SDK
+                # versions.  Register both aliases against the same processor.
                 platform.event_handler._callback_processor_map[
                     "p2.card.action.trigger"
-                ] = P2CardActionTriggerProcessor(self.handle_card_action_sync)
+                ] = processor
+                platform.event_handler._callback_processor_map[
+                    "card.action.trigger"
+                ] = processor
                 logger.info("✅ 飞书卡片动作处理器已注入事件分发器")
 
     # ── Card action callback ─────────────────────────────────────────────────
 
-    def handle_card_action_sync(self, data: P2CardActionTrigger) -> P2CardActionTriggerResponse:
+    def handle_card_action_sync(
+        self, data: P2CardActionTrigger, *, lark_api=None
+    ) -> P2CardActionTriggerResponse:
         """Route card button clicks to the correct response.
 
         Must be synchronous — no awaits. Async side-effects (e.g. sending a
@@ -162,6 +192,10 @@ class LarkCardService:
             if data.event.context is not None
             else ""
         )
+        self.bind_lark_api(open_id, lark_api)
+        set_active_lark_api(lark_api)
+        if self.contact_service:
+            self.contact_service.bind_lark_api(open_id, lark_api)
 
         # ──Functionalities testing card action callback ─────────────────────────────────────────────────
 
@@ -267,6 +301,17 @@ class LarkCardService:
                     bool(get_dept_folder_token(getattr(e["dept"], "open_department_id", "") or ""))
                     for e in managed
                 )
+                # TEMP TEST OVERRIDE (Justin): allow the manager dashboard path
+                # even while the test contact tree/folder binding is incomplete.
+                # TODO(public launch): remove WRSBOT_TEST_ADMIN_OPEN_IDS and this
+                # bypass; authorization must then rely only on Feishu leaders.
+                is_test_admin = (
+                    self.contact_service is not None
+                    and self.contact_service.is_test_admin(open_id)
+                )
+                if is_test_admin:
+                    logger.warning("[Lark_card] 临时 Justin 测试权限：跳过文件夹绑定门槛")
+                    all_bound = True
                 if not all_bound:
                     return P2CardActionTriggerResponse(
                         {"card": self._build_not_binding_card_data(open_id)}
@@ -377,8 +422,8 @@ class LarkCardService:
             logger.info(f"[Lark_card] 文件夹绑定成功: dept={dept_id} token={token}")
             # Resolve dept name from cached org tree for the success card display.
             dept_name = ""
-            if self.contact_service and self.contact_service._org_tree_cache:
-                for e in self.contact_service._org_tree_cache:
+            if self.contact_service:
+                for e in self.contact_service.get_cached_org_tree_sync(open_id):
                     if getattr(e["dept"], "open_department_id", "") == dept_id:
                         dept_name = e["dept"].name or ""
                         break
@@ -433,7 +478,9 @@ class LarkCardService:
         if action_key == "rescan_org_tree":
             logger.info("[Lark_card] 重新扫描通讯录")
             if self.contact_service:
-                asyncio.create_task(self.contact_service._do_refresh())
+                asyncio.create_task(
+                    self.contact_service._do_refresh(open_id, lark_api=lark_api)
+                )
             return P2CardActionTriggerResponse({
                 "toast": {
                     "type": "info",
@@ -728,7 +775,9 @@ class LarkCardService:
     
     # ── Functional testing cards sending ─────────────────────────────────────────────────────────
 
-    async def patch_card(self, message_id: str, card_id: str, template_variables: dict) -> bool:
+    async def patch_card(
+        self, message_id: str, card_id: str, template_variables: dict, *, lark_api=None
+    ) -> bool:
         """Replace an existing card in-place using the Feishu patch message API.
 
         message_id: open_message_id from the card action trigger context
@@ -756,13 +805,14 @@ class LarkCardService:
             )
             .build()
         )
-        resp = await self.lark_api.im.v1.message.apatch(req)
+        api = self.get_lark_api(lark_api=lark_api)
+        resp = await api.im.v1.message.apatch(req)
         if not resp.success():
             logger.warning(f"[LarkCard] patch_card 失败: code={resp.code} msg={resp.msg}")
             return False
         return True
 
-    async def patch_inline_card(self, message_id: str, card_json: dict) -> bool:
+    async def patch_inline_card(self, message_id: str, card_json: dict, *, lark_api=None) -> bool:
         """Patch an existing message in-place with a raw (non-template) card JSON.
 
         Patch API takes the card JSON directly as content — no {"type":"raw","data":...}
@@ -777,7 +827,8 @@ class LarkCardService:
             .request_body(PatchMessageRequestBody.builder().content(content).build())
             .build()
         )
-        resp = await self.lark_api.im.v1.message.apatch(req)
+        api = self.get_lark_api(lark_api=lark_api)
+        resp = await api.im.v1.message.apatch(req)
         if not resp.success():
             logger.warning(f"[LarkCard] patch_inline_card 失败: code={resp.code} msg={resp.msg}")
             return False
@@ -789,8 +840,11 @@ class LarkCardService:
         receive_id: str,
         card_id: str,
         template_variables: dict,
+        *,
+        lark_api=None,
+        reply_message_id: str = "",
     ) -> bool:
-        """Base method — send any Feishu template card by ID and variables."""
+        """Send a template card, optionally replying through an incoming event's app."""
         from astrbot.core.platform.sources.lark.lark_event import LarkMessageEvent
 
         content = json.dumps(
@@ -804,11 +858,12 @@ class LarkCardService:
             ensure_ascii=False,
         )
         return await LarkMessageEvent._send_im_message(
-            self.lark_api,
+            self.get_lark_api(receive_id, lark_api),
             content=content,
             msg_type="interactive",
             receive_id=receive_id,
             receive_id_type=receive_id_type,
+            reply_message_id=reply_message_id,
         )
 
     # ── Testing functions, disabled when unused ─────────────────────────────────────────────────────────
@@ -838,13 +893,34 @@ class LarkCardService:
 
     # ── WRSbot workflow cards sending ─────────────────────────────────────────────────────────
 
-    async def send_wrsbot_welcome(self, open_id: str) -> bool:
-        """Send wrsbot welcome card to a user by open_id"""
+    async def send_wrsbot_welcome(
+        self, *, open_id: str, reply_message_id: str, lark_api=None
+    ) -> bool:
+        """Reply to a received message with the WRSbot welcome card.
+
+        ``lark_api`` should be the client carried by the incoming event.  A
+        plugin-level cached client may belong to a different Lark adapter.
+        """
         if not WRSBOT_WELCOME_CARD_ID:
             logger.warning("[Lark_card] WRSBOT_WELCOME_CARD_ID not set, skipped sending welcome card")
             return False
-        return await self. send_template_card(
-            "open_id", open_id, WRSBOT_WELCOME_CARD_ID,{"open_id": open_id}
+        from astrbot.core.platform.sources.lark.lark_event import LarkMessageEvent
+
+        content = json.dumps(
+            {
+                "type": "template",
+                "data": {
+                    "template_id": WRSBOT_WELCOME_CARD_ID,
+                    "template_variable": {"open_id": open_id},
+                },
+            },
+            ensure_ascii=False,
+        )
+        return await LarkMessageEvent._send_im_message(
+            self.get_lark_api(open_id, lark_api),
+            content=content,
+            msg_type="interactive",
+            reply_message_id=reply_message_id,
         )
 
     # ── Folder binding status ────────────────────────────────────────────────
@@ -865,8 +941,10 @@ class LarkCardService:
             for e in managed
         )
 
-    async def send_binding_success_card(self, open_id: str) -> bool:
-        """Send the binding-success template card to a user as a DM."""
+    async def send_binding_success_card(
+        self, open_id: str, *, lark_api=None, reply_message_id: str = ""
+    ) -> bool:
+        """Send the binding-success card, optionally as a reply to an inbound message."""
         managed = self._get_managed_depts(open_id)
         if not managed:
             dept_name = "未知部门"
@@ -877,9 +955,13 @@ class LarkCardService:
         return await self.send_template_card(
             "open_id", open_id, WRSBOT_BINDING_FEEDBACK_SUCCESS_CARD_ID,
             {"open_id": open_id, "dept_name": dept_name},
+            lark_api=lark_api,
+            reply_message_id=reply_message_id,
         )
 
-    async def send_not_binding_card(self, open_id: str) -> None:
+    async def send_not_binding_card(
+        self, open_id: str, *, lark_api=None, reply_message_id: str = ""
+    ) -> None:
         """Send the folder-binding status card to a user as a DM.
 
         Routes between single-dept template card and multi-dept inline JSON
@@ -899,14 +981,17 @@ class LarkCardService:
                 "open_id", open_id,
                 data["template_id"],
                 data.get("template_variable", {}),
+                lark_api=lark_api,
+                reply_message_id=reply_message_id,
             )
         else:  # raw inline card (multi-dept)
             await LarkMessageEvent._send_im_message(
-                self.lark_api,
+                self.get_lark_api(open_id, lark_api),
                 content=json.dumps(data, ensure_ascii=False),
                 msg_type="interactive",
                 receive_id=open_id,
                 receive_id_type="open_id",
+                reply_message_id=reply_message_id,
             )
 
 
@@ -941,7 +1026,10 @@ class LarkCardService:
             "not_submitted_names":              "、".join(not_submitted) or "（无）",
         }
         if message_id:
-            return await self.patch_card(message_id, WRSBOT_ADMIN_VIEW_CARD_ID, variables)
+            return await self.patch_card(
+                message_id, WRSBOT_ADMIN_VIEW_CARD_ID, variables,
+                lark_api=self.get_lark_api(open_id),
+            )
         return await self.send_template_card("open_id", open_id, WRSBOT_ADMIN_VIEW_CARD_ID, variables)
 
     async def send_user_view_card(self, open_id: str, dept_name: str, is_submitted: bool, message_id: str = "") -> bool:
@@ -961,7 +1049,10 @@ class LarkCardService:
             "user_submission_status": status,
         }
         if message_id:
-            return await self.patch_card(message_id, WRSBOT_CARD_USER_VIEW_ID, variables)
+            return await self.patch_card(
+                message_id, WRSBOT_CARD_USER_VIEW_ID, variables,
+                lark_api=self.get_lark_api(open_id),
+            )
         return await self.send_template_card("open_id", open_id, WRSBOT_CARD_USER_VIEW_ID, variables)
 
     async def send_style_config_card(
@@ -999,13 +1090,16 @@ class LarkCardService:
             "open_id", open_id, WRSBOT_STYLE_CONFIG_CARD_ID, variables,
         )
 
-    async def send_generated_success_card(self, message_id: str) -> None:
+    async def send_generated_success_card(self, open_id: str, message_id: str) -> None:
         """Patch the 'generating' card in-place with the 'generated successfully' notice."""
         # Using official Feishu CardKit template (WRSBOT_SUMMARY_REWRITE_CARD_ID)
         # instead of the inline _SUMMARY_ACTION_CARD — inline-form binding has
         # been unreliable for form_value. Template card handles form logic in
         # Feishu's card builder.
-        await self.patch_card(message_id, WRSBOT_SUMMARY_REWRITE_CARD_ID, {})
+        await self.patch_card(
+            message_id, WRSBOT_SUMMARY_REWRITE_CARD_ID, {},
+            lark_api=self.get_lark_api(open_id),
+        )
         # await self.patch_inline_card(message_id, _SUMMARY_ACTION_CARD)
 
     # ── CardKit streaming helpers ────────────────────────────────────────────
@@ -1031,9 +1125,10 @@ class LarkCardService:
     # Re-implementing here keeps us stable across AstrBot versions. If those
     # helpers ever become @staticmethod on a public surface, switch to them.
 
-    async def create_streaming_card(self, header_title: str = "") -> str | None:
+    async def create_streaming_card(self, open_id: str, header_title: str = "") -> str | None:
         """Create a CardKit streaming card entity. Returns card_id or None."""
-        if not self.lark_api or self.lark_api.cardkit is None:
+        api = self.get_lark_api(open_id)
+        if not api or api.cardkit is None:
             logger.error("[LarkCard] CardKit 模块未初始化")
             return None
 
@@ -1069,13 +1164,14 @@ class LarkCardService:
             .build()
         )
         try:
-            resp = await self.lark_api.cardkit.v1.card.acreate(req)
+            resp = await api.cardkit.v1.card.acreate(req)
         except Exception as e:
             logger.error(f"[LarkCard] 创建流式卡片失败: {e}")
             return None
         if not resp.success() or resp.data is None or not resp.data.card_id:
             logger.error(f"[LarkCard] 创建流式卡片失败({resp.code}): {resp.msg}")
             return None
+        self._lark_api_by_streaming_card_id[resp.data.card_id] = api
         return resp.data.card_id
 
     async def send_streaming_card_to_user(self, open_id: str, card_id: str) -> bool:
@@ -1086,7 +1182,7 @@ class LarkCardService:
             {"type": "card", "data": {"card_id": card_id}}, ensure_ascii=False
         )
         return await LarkMessageEvent._send_im_message(
-            self.lark_api,
+            self.get_lark_api(open_id),
             content=content,
             msg_type="interactive",
             receive_id=open_id,
@@ -1097,7 +1193,8 @@ class LarkCardService:
         self, card_id: str, content: str, sequence: int
     ) -> bool:
         """Push the full accumulated text to the streaming card's markdown_1 element."""
-        if not self.lark_api or self.lark_api.cardkit is None:
+        api = self._lark_api_by_streaming_card_id.get(card_id) or self.lark_api
+        if not api or api.cardkit is None:
             return False
 
         from lark_oapi.api.cardkit.v1 import (
@@ -1119,7 +1216,7 @@ class LarkCardService:
             .build()
         )
         try:
-            resp = await self.lark_api.cardkit.v1.card_element.acontent(req)
+            resp = await api.cardkit.v1.card_element.acontent(req)
         except Exception as e:
             logger.debug(f"[LarkCard] 流式更新失败 (ignored): {e}")
             return False
@@ -1130,7 +1227,8 @@ class LarkCardService:
 
     async def close_streaming_card(self, card_id: str, sequence: int) -> None:
         """Close streaming mode so the card is forwardable / static afterwards."""
-        if not self.lark_api or self.lark_api.cardkit is None:
+        api = self._lark_api_by_streaming_card_id.get(card_id) or self.lark_api
+        if not api or api.cardkit is None:
             return
 
         from lark_oapi.api.cardkit.v1 import SettingsCardRequest, SettingsCardRequestBody
@@ -1151,12 +1249,13 @@ class LarkCardService:
             .build()
         )
         try:
-            resp = await self.lark_api.cardkit.v1.card.asettings(req)
+            resp = await api.cardkit.v1.card.asettings(req)
         except Exception as e:
             logger.error(f"[LarkCard] 关闭流式异常: {e}")
             return
         if not resp.success():
             logger.warning(f"[LarkCard] 关闭流式失败({resp.code}): {resp.msg}")
+        self._lark_api_by_streaming_card_id.pop(card_id, None)
 
     async def send_summary_action_card(self, open_id: str) -> None:
         """Send the post-generation action card with rewrite input and two buttons."""
@@ -1181,11 +1280,7 @@ class LarkCardService:
         """Return org tree entries where this user is the department leader."""
         if not self.contact_service:
             return []
-        org_tree = self.contact_service._org_tree_cache or []
-        return [
-            e for e in org_tree
-            if e.get("manager") and e["manager"].open_id == open_id
-        ]
+        return self.contact_service.get_managed_depts_sync(open_id)
 
     def _build_style_display_card_data(self, profile: dict) -> dict:
         """Build a view-only inline card showing the manager's saved style.
@@ -1307,6 +1402,34 @@ class LarkCardService:
             },
         }
 
+    def _binding_card_dept_name(self, open_id: str, default_name: str) -> str:
+        """Choose the department label used by a binding-status template.
+
+        The temporary test-admin override can grant a user manager access to
+        a fallback department while their actual Feishu membership remains in
+        another department.  For that one testing route, show the membership
+        department so the binding card agrees with the submission dashboard.
+        This changes presentation only: binding actions still target the
+        managed department selected by the existing binding flow.
+        """
+        if not self.contact_service or not self.contact_service.is_test_admin(open_id):
+            return default_name
+
+        for entry in self.contact_service.get_cached_org_tree_sync(open_id):
+            if any(
+                getattr(member, "open_id", None) == open_id
+                for member in entry.get("members", [])
+            ):
+                member_dept_name = entry["dept"].name or default_name
+                logger.info(
+                    f"[Lark_card] 测试管理员绑定卡片使用成员部门名称: "
+                    f"open_id={open_id} dept={member_dept_name} "
+                    f"managed_dept={default_name}"
+                )
+                return member_dept_name
+
+        return default_name
+
     def _build_not_binding_card_data(self, open_id: str, *, failed: bool = False) -> dict:
         """Return the card 'type'+'data' dict for the binding status card.
 
@@ -1325,6 +1448,8 @@ class LarkCardService:
             for e in managed
         ):
             dept_name = managed[0]["dept"].name or "" if len(managed) == 1 else "所有部门"
+            if len(managed) == 1:
+                dept_name = self._binding_card_dept_name(open_id, dept_name)
             return {
                 "type": "template",
                 "data": {
@@ -1361,7 +1486,7 @@ class LarkCardService:
                 "data": {
                     "template_id": WRSBOT_NOT_BINDiNG_FEEDBACK_CARD_ID,
                     "template_variable": {
-                        "dept_name": dept.name or "",
+                        "dept_name": self._binding_card_dept_name(open_id, dept.name or ""),
                         "dept_num": 1,
                         "unreg_dept_num": 0 if (is_bound and not failed) else 1,
                         "binding_status": status,
@@ -1710,7 +1835,7 @@ _HELP_CARD = {
 # │  文件夹配置           │  always                  │  → BINDFOLDER_TUTORIAL    │
 # │  开始使用             │  已配置 · 管理员          │  → ADMIN_DASHBOARD [TBD]  │
 # │  开始使用             │  已配置 · 员工            │  → USER_DASHBOARD  [TBD]  │
-# │  开始使用 [disabled]  │  文件夹未配置             │  toast: 请先完成配置      │
+# │  开始使用 [disabled]  │  文件夹未配置             │  toast: 请先完成配置      │ 
 # └──────────────────────┴──────────────────────────┴───────────────────────────┘
 #
 # ┌──────────────────────────────────────────────────────────────────────────────┐

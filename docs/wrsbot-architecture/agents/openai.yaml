@@ -1,0 +1,4 @@
+interface:
+  display_name: "WRSbot Architecture"
+  short_description: "Implement and maintain the WRSbot Feishu weekly-report workflow."
+  default_prompt: "Use $wrsbot-architecture to understand this plugin before changing its architecture or workflow."

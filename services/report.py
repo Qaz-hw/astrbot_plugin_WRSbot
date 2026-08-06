@@ -426,7 +426,7 @@ async def check_submissions(
     dept_name = ""
 
     try:
-        org_tree = await contact_service.get_cached_org_tree()
+        org_tree = await contact_service.get_cached_org_tree(sender_id)
         for entry in org_tree:
             in_dept = any(
                 getattr(m, "open_id", None) == sender_id

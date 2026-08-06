@@ -16,6 +16,7 @@
 #==============================================================
 
 import json
+import os
 import re
 from pathlib import Path
 from dotenv import load_dotenv
@@ -34,6 +35,7 @@ from .services.bitable import BitableService
 from .services.contact import ContactService
 from .services.pipelines import ViewsPipelines, ReportPipelines, StylePipelines
 from .utils.env_config import dump_dept_bindings
+from .services.lark_context import set_active_lark_api
 
 # TODO: add more comments for future dev
 # TODO: Setup persona for user and admin for things like when they are talking to the bot 
@@ -53,10 +55,32 @@ class MyPlugin(Star):
     async def initialize(self):
         """Grab lark_api from the platform adapter and set up services."""
         get_insts = getattr(self.context.platform_manager, "get_insts", None)
+        # This installation has both a small test Feishu app and the real
+        # MRSbot app enabled.  Warm only the latter at startup; inbound events
+        # still bind their own adapter normally.
+        startup_platform_id = os.getenv("WRSBOT_STARTUP_LARK_PLATFORM_ID", "MRSbot")
+        lark_apis = []
+        startup_lark_apis = []
         if get_insts:
             for platform in get_insts():
-                if hasattr(platform, "lark_api") and self.lark_api is None:
-                    self.lark_api = platform.lark_api
+                if hasattr(platform, "lark_api"):
+                    lark_apis.append(platform.lark_api)
+                    if getattr(platform, "platform_id", "") == startup_platform_id:
+                        startup_lark_apis.append(platform.lark_api)
+
+        if startup_lark_apis:
+            self.lark_api = startup_lark_apis[0]
+            logger.info(
+                f"[WRSbot] 启动时使用飞书平台 {startup_platform_id!r} 预热通讯录缓存"
+            )
+        elif lark_apis:
+            # Keep the plugin operational if this deployment uses a different
+            # platform ID, but make the configuration issue unmistakable.
+            self.lark_api = lark_apis[0]
+            logger.warning(
+                f"[WRSbot] 未找到启动预热平台 {startup_platform_id!r}；"
+                "将等待入站飞书事件选择通讯录缓存"
+            )
 
         self.card_service = LarkCardService(self.lark_api)
         self.card_service.inject_into_dispatcher(self.context.platform_manager)
@@ -64,7 +88,7 @@ class MyPlugin(Star):
         self.drive_service = DriveService(self.lark_api)
         self.bitable_service = BitableService(self.lark_api)
         self.contact_service = ContactService(self.lark_api)
-        await self.contact_service.start_cache()
+        await self.contact_service.start_cache(startup_lark_apis)
         self.card_service.contact_service = self.contact_service
         # ── Pipelines (orchestration layer; see services/pipelines/) ────────
         # Three domain classes, all sharing the same service handles via
@@ -108,7 +132,16 @@ class MyPlugin(Star):
             yield event.plain_result("This command is only abled on Lark/Feishu")
             return
 
-        await self.card_service.send_wrsbot_welcome(event.get_sender_id())
+        self.card_service.bind_lark_api(event.get_sender_id(), event.bot)
+        self.contact_service.bind_lark_api(event.get_sender_id(), event.bot)
+        set_active_lark_api(event.bot)
+        # Reply in the incoming conversation rather than starting a new DM by
+        # open_id.  This avoids Feishu's "open_id cross app" error.
+        await self.card_service.send_wrsbot_welcome(
+            open_id=event.get_sender_id(),
+            reply_message_id=event.message_obj.message_id,
+            lark_api=event.bot,
+        )
         event._has_send_oper = True
 
     @filter.command("文件夹配置")
@@ -125,10 +158,22 @@ class MyPlugin(Star):
             return
 
         open_id = event.get_sender_id()
+        self.card_service.bind_lark_api(open_id, event.bot)
+        self.contact_service.bind_lark_api(open_id, event.bot)
+        set_active_lark_api(event.bot)
+        reply_message_id = event.message_obj.message_id
         if self.card_service.is_fully_bound(open_id):
-            await self.card_service.send_binding_success_card(open_id)
+            await self.card_service.send_binding_success_card(
+                open_id,
+                lark_api=event.bot,
+                reply_message_id=reply_message_id,
+            )
         else:
-            await self.card_service.send_not_binding_card(open_id)
+            await self.card_service.send_not_binding_card(
+                open_id,
+                lark_api=event.bot,
+                reply_message_id=reply_message_id,
+            )
         event._has_send_oper = True
 
     @filter.command("清除所有绑定")
@@ -245,7 +290,16 @@ class MyPlugin(Star):
             yield event.plain_result("未找到飞书适配器，请确认当前平台为飞书。")
             return
         try:
-            org_tree = await self.contact_service.get_org_tree()
+            lark_api = getattr(event, "bot", None)
+            self.contact_service.bind_lark_api(
+                event.get_sender_id(), lark_api, schedule_refresh=False
+            )
+            await self.contact_service._do_refresh(
+                event.get_sender_id(), lark_api=lark_api
+            )
+            org_tree = await self.contact_service.get_cached_org_tree(
+                event.get_sender_id(), lark_api=lark_api
+            )
         except Exception as e:
             yield event.plain_result(f"获取部门列表失败: {e}")
             return
@@ -260,7 +314,11 @@ class MyPlugin(Star):
             yield event.plain_result("未找到飞书适配器，请确认当前平台为飞书。")
             return
         try:
-            org_tree = await self.contact_service.get_cached_org_tree()
+            lark_api = getattr(event, "bot", None)
+            self.contact_service.bind_lark_api(event.get_sender_id(), lark_api)
+            org_tree = await self.contact_service.get_cached_org_tree(
+                event.get_sender_id(), lark_api=lark_api
+            )
         except Exception as e:
             yield event.plain_result(f"获取缓存失败: {e}")
             return
@@ -272,7 +330,7 @@ class MyPlugin(Star):
     async def dump_bindings(self, event: AstrMessageEvent):
         """[Developer] 显示所有部门文件夹绑定状态，与缓存通讯录交叉校验。"""
         try:
-            org_tree = await self.contact_service.get_cached_org_tree()
+            org_tree = await self.contact_service.get_cached_org_tree(event.get_sender_id())
         except Exception as e:
             yield event.plain_result(f"获取缓存失败: {e}")
             return
@@ -284,8 +342,13 @@ class MyPlugin(Star):
         if not self.lark_api:
             yield event.plain_result("未找到飞书适配器，请确认当前平台为飞书。")
             return
+        self.contact_service.bind_lark_api(
+            event.get_sender_id(), getattr(event, "bot", None)
+        )
         yield event.plain_result(
-            await self.contact_service.get_user_profile_dump(event.get_sender_id())
+            await self.contact_service.get_user_profile_dump(
+                event.get_sender_id(), lark_api=getattr(event, "bot", None)
+            )
         )
 
     @filter.command("list_contacts")
@@ -298,7 +361,9 @@ class MyPlugin(Star):
             return
 
         try:
-            contacts, errors = await self.contact_service.list_all_members()
+            lark_api = getattr(event, "bot", None)
+            self.contact_service.bind_lark_api(event.get_sender_id(), lark_api)
+            contacts, errors = await self.contact_service.list_all_members(lark_api=lark_api)
         except Exception as e:
             yield event.plain_result(f"获取部门列表失败: {e}")
             return
@@ -596,6 +661,8 @@ class MyPlugin(Star):
             return
 
         open_id = event.get_sender_id()
+        self.card_service.bind_lark_api(open_id, event.bot)
+        set_active_lark_api(event.bot)
         provider = self.context.get_using_provider(
             umo=f"lark:open_id:{open_id}"
         )
@@ -781,7 +848,7 @@ class _DocTestRunner:
 
         sender_id = event.get_sender_id()
         try:
-            org_tree = await self.plugin.contact_service.get_cached_org_tree()
+            org_tree = await self.plugin.contact_service.get_cached_org_tree(sender_id)
         except Exception as e:
             logger.warning(f"[DocTest] 通讯录缓存未就绪，无法自动匹配文件夹: {e}")
             return "", "未知（通讯录缓存未就绪）"
@@ -820,8 +887,8 @@ class _DocTestRunner:
     async def _save_token(self, event, folder_token: str, set_fn) -> list[str]:
         lines = []
         try:
-            org_tree = await self.plugin.contact_service.get_cached_org_tree()
             sender_id = event.get_sender_id()
+            org_tree = await self.plugin.contact_service.get_cached_org_tree(sender_id)
             managed = [e for e in org_tree if e.get("manager") and e["manager"].open_id == sender_id]
             if managed:
                 open_dept_id = getattr(managed[0]["dept"], "open_department_id", "") or ""
@@ -1121,7 +1188,7 @@ class _WeeklyFileTestRunner:
         from .utils.env_config import get_dept_folder_token
         sender_id = event.get_sender_id()
         try:
-            org_tree = await self.plugin.contact_service.get_cached_org_tree()
+            org_tree = await self.plugin.contact_service.get_cached_org_tree(sender_id)
         except Exception as e:
             return "", f"未知（通讯录缓存未就绪: {e}）"
 

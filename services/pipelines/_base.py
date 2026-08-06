@@ -90,7 +90,7 @@ class PipelineBase:
         """
         from ...utils.env_config import get_dept_folder_url
 
-        org_tree = await self.contact_service.get_cached_org_tree()
+        org_tree = await self.contact_service.get_cached_org_tree(open_id)
         dept_entry = next(
             (e for e in org_tree
              if any(getattr(m, "open_id", None) == open_id for m in e.get("members", []))),
@@ -105,11 +105,43 @@ class PipelineBase:
 
         url = get_dept_folder_url(open_dept_id)
         if url:
+            logger.info(
+                f"[ViewDoc] 使用成员部门文件夹: dept={dept_name} "
+                f"open_dept_id={open_dept_id}"
+            )
             return (
                 f"📂 {dept_name} 本周周报文件夹：\n{url}\n\n"
                 f"请进入文件夹，找到本周对应的周报文档/多维表格并填写您的内容～"
             )
 
+        # A department manager can be a member of a child department while
+        # managing (and binding the weekly-report folder for) its parent.
+        # This is also the intended route for the explicit test-admin override.
+        # In that case, fall back to a folder owned by one of the departments
+        # they manage instead of incorrectly reporting that no folder exists.
+        managed = await self.contact_service.get_managed_depts(open_id)
+        for managed_entry in managed:
+            managed_dept = managed_entry["dept"]
+            managed_dept_id = getattr(managed_dept, "open_department_id", "") or ""
+            managed_url = get_dept_folder_url(managed_dept_id)
+            if not managed_url:
+                continue
+
+            managed_name = managed_dept.name or managed_dept_id
+            logger.info(
+                f"[ViewDoc] 成员部门未绑定，使用管理部门文件夹: "
+                f"member_dept={dept_name} member_dept_id={open_dept_id} "
+                f"managed_dept={managed_name} managed_dept_id={managed_dept_id}"
+            )
+            return (
+                f"📂 {managed_name} 本周周报文件夹：\n{managed_url}\n\n"
+                f"您当前属于「{dept_name}」，此处显示您管理部门的周报文件夹。"
+            )
+
+        logger.warning(
+            f"[ViewDoc] 未找到可用文件夹: dept={dept_name} "
+            f"open_dept_id={open_dept_id} managed_count={len(managed)}"
+        )
         return (
             f"{dept_name} 尚未绑定周报文件夹。"
             f"请联系部门负责人执行 /文件夹配置 完成绑定。"
@@ -149,7 +181,7 @@ class PipelineBase:
         """
         import asyncio
 
-        card_id = await self.card_service.create_streaming_card(header_title)
+        card_id = await self.card_service.create_streaming_card(open_id, header_title)
         sent = False
         if card_id:
             sent = await self.card_service.send_streaming_card_to_user(open_id, card_id)
@@ -213,12 +245,13 @@ class PipelineBase:
         callers can use this as an error-notification fallback without
         risking a secondary exception masking the original failure.
         """
-        if not self.lark_api or not open_id or not text:
+        api = self.card_service.get_lark_api(open_id)
+        if not api or not open_id or not text:
             return
         from astrbot.core.platform.sources.lark.lark_event import LarkMessageEvent
         try:
             await LarkMessageEvent._send_im_message(
-                self.lark_api,
+                api,
                 content=json.dumps({"text": text}, ensure_ascii=False),
                 msg_type="text",
                 receive_id=open_id,
@@ -248,7 +281,8 @@ class PipelineBase:
             dept_name:   prefix in the post title (e.g. "AI 研究部")
             iso_week:    week tag in the post title (e.g. "2026-W21")
         """
-        if not self.lark_api:
+        api = self.card_service.get_lark_api(open_id)
+        if not api:
             return
         from astrbot.core.platform.sources.lark.lark_event import LarkMessageEvent
 
@@ -260,7 +294,7 @@ class PipelineBase:
             }
         }
         await LarkMessageEvent._send_im_message(
-            self.lark_api,
+            api,
             content=json.dumps(content, ensure_ascii=False),
             msg_type="post",
             receive_id=open_id,

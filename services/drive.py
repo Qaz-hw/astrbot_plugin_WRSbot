@@ -27,6 +27,7 @@ from typing import Awaitable, Callable
 
 from astrbot.api import logger
 from lark_oapi.api.drive.v1 import ListFileRequest
+from .lark_context import get_active_lark_api
 
 # Matches date-range names like:
 #   2026.5.19-2026.5.25   2025-5-19~2025-5-25   2025/5/19至2025/5/25
@@ -58,7 +59,8 @@ class DriveService:
             .direction("DESC")
             .build()
         )
-        resp = await self.lark_api.drive.v1.file.alist(req)
+        api = get_active_lark_api(self.lark_api)
+        resp = await api.drive.v1.file.alist(req)
         if not resp.success():
             raise RuntimeError(
                 f"[Drive] 文件夹列表失败: code={resp.code} msg={resp.msg}"

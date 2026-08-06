@@ -31,8 +31,8 @@ from lark_oapi.api.docx.v1 import (
     Block,
 )
 from lark_oapi.api.drive.v1 import ListFileRequest
-from lark_oapi.core.json import JSON as _LarkJSON
 from astrbot.api import logger
+from .lark_context import get_active_lark_api
 
 
 class DocService:
@@ -47,7 +47,7 @@ class DocService:
             .page_size(10)
             .build()
         )
-        resp = await self.lark_api.drive.v1.file.alist(req)
+        resp = await get_active_lark_api(self.lark_api).drive.v1.file.alist(req)
         if not resp.success():
             raise RuntimeError(f"code={resp.code} msg={resp.msg}")
         return resp.data.files or []
@@ -63,7 +63,7 @@ class DocService:
             .document_id(doc_token)
             .build()
         )
-        resp = await self.lark_api.docx.v1.document.araw_content(req)
+        resp = await get_active_lark_api(self.lark_api).docx.v1.document.araw_content(req)
         if not resp.success():
             raise RuntimeError(f"code={resp.code} msg={resp.msg}")
         return resp.data.content or ""
@@ -90,7 +90,7 @@ class DocService:
             if page_token:
                 builder = builder.page_token(page_token)
 
-            resp = await self.lark_api.docx.v1.document_block.alist(builder.build())
+            resp = await get_active_lark_api(self.lark_api).docx.v1.document_block.alist(builder.build())
             if not resp.success():
                 raise RuntimeError(
                     f"[Doc] blocks 读取失败: code={resp.code} msg={resp.msg}"
@@ -128,68 +128,53 @@ class DocService:
         if not blocks:
             return 0
 
-        # In docx v1, the document root block_id equals the document_id.
+        # Feishu limits `children` to 50 blocks per request.  Keep appending
+        # at the advancing root index so a long generated report stays in its
+        # original order rather than failing or being inserted backwards.
+        max_blocks_per_request = 50
         append_index = await self._get_root_children_count(doc_id)
+        api = get_active_lark_api(self.lark_api)
 
-        body = (
-            CreateDocumentBlockChildrenRequestBody.builder()
-            .children([Block(b) for b in blocks])
-            .index(append_index)
-            .build()
-        )
-        # Diagnostic: dump exactly what Feishu will receive, so 1770001 errors
-        # can be inspected. The Encoder filters None fields, so this is the
-        # post-serialization body.
-        try:
-            body_json = _LarkJSON.marshal(body)
-            #Debug logger. Disabled when not used
-            #logger.warning(
-            #    f"[Doc] append_report request body (len={len(body_json or '')}): {body_json}"
-            #)
-            logger.debug
-        except Exception as e:
-            logger.warning(f"[Doc] body 序列化预览失败: {e}")
-
-        req = (
-            CreateDocumentBlockChildrenRequest.builder()
-            .document_id(doc_id)
-            .block_id(doc_id)
-            .document_revision_id(-1)  # -1 = latest revision
-            .request_body(body)
-            .build()
-        )
-        resp = await self.lark_api.docx.v1.document_block_children.acreate(req)
-        if not resp.success():
-            # Surface every diagnostic Feishu hands back.
-            violation_details = ""
-            err = getattr(resp, "error", None)
-            if err is not None:
-                fvs = getattr(err, "field_violations", None) or []
-                if fvs:
-                    violation_details = " field_violations=" + "; ".join(
-                        f"{getattr(fv, 'field', '?')}={getattr(fv, 'value', '?')!r}: {getattr(fv, 'description', '?')}"
-                        for fv in fvs
-                    )
-                log_id = getattr(err, "log_id", None)
-                if log_id:
-                    violation_details += f" log_id={log_id}"
-            # Dump the raw HTTP response body — sometimes contains an `ext`
-            # field or detailed reason the SDK doesn't expose via .error.
-            raw_body = ""
-            raw = getattr(resp, "raw", None)
-            if raw is not None and raw.content:
-                try:
-                    raw_body = " raw=" + raw.content.decode("utf-8", errors="replace")
-                except Exception:
-                    raw_body = f" raw=<{len(raw.content)} bytes, decode failed>"
-            raise RuntimeError(
-                f"[Doc] append_report 失败: code={resp.code} msg={resp.msg} "
-                f"doc_id={doc_id} index={append_index} n_blocks={len(blocks)}"
-                f"{violation_details}{raw_body}"
+        for batch_start in range(0, len(blocks), max_blocks_per_request):
+            batch = blocks[batch_start : batch_start + max_blocks_per_request]
+            body = (
+                CreateDocumentBlockChildrenRequestBody.builder()
+                .children([Block(block) for block in batch])
+                .index(append_index)
+                .build()
             )
-        logger.debug(
-            f"[Doc] append_report: doc={doc_id} index={append_index} blocks={len(blocks)}"
-        )
+            req = (
+                CreateDocumentBlockChildrenRequest.builder()
+                .document_id(doc_id)
+                .block_id(doc_id)
+                .document_revision_id(-1)  # -1 = latest revision
+                .request_body(body)
+                .build()
+            )
+            resp = await api.docx.v1.document_block_children.acreate(req)
+            if not resp.success():
+                violation_details = ""
+                err = getattr(resp, "error", None)
+                if err is not None:
+                    fvs = getattr(err, "field_violations", None) or []
+                    if fvs:
+                        violation_details = " field_violations=" + "; ".join(
+                            f"{getattr(fv, 'field', '?')}={getattr(fv, 'value', '?')!r}: {getattr(fv, 'description', '?')}"
+                            for fv in fvs
+                        )
+                    log_id = getattr(err, "log_id", None)
+                    if log_id:
+                        violation_details += f" log_id={log_id}"
+                raise RuntimeError(
+                    f"[Doc] append_report 失败: code={resp.code} msg={resp.msg} "
+                    f"doc_id={doc_id} index={append_index} batch_start={batch_start} "
+                    f"batch_blocks={len(batch)} total_blocks={len(blocks)}{violation_details}"
+                )
+            logger.debug(
+                f"[Doc] append_report: doc={doc_id} index={append_index} blocks={len(batch)}"
+            )
+            append_index += len(batch)
+
         return len(blocks)
 
     async def _get_root_children_count(self, doc_id: str) -> int:
@@ -205,7 +190,7 @@ class DocService:
             .build()
         )
         try:
-            resp = await self.lark_api.docx.v1.document_block.aget(req)
+            resp = await get_active_lark_api(self.lark_api).docx.v1.document_block.aget(req)
         except Exception as e:
             logger.warning(f"[Doc] 获取根块异常，回退 index=0: {e}")
             return 0

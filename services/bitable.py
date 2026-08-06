@@ -24,6 +24,7 @@ from lark_oapi.api.bitable.v1 import (
     AppTableRecord,
 )
 from astrbot.api import logger
+from .lark_context import get_active_lark_api
 
 
 class BitableService:
@@ -33,7 +34,7 @@ class BitableService:
     async def list_tables(self, app_token: str) -> list[dict]:
         """List all tables in a Bitable app. Returns [{table_id, name}]."""
         req = ListAppTableRequest.builder().app_token(app_token).build()
-        resp = await self.lark_api.bitable.v1.app_table.alist(req)
+        resp = await get_active_lark_api(self.lark_api).bitable.v1.app_table.alist(req)
         if not resp.success():
             raise RuntimeError(f"[Bitable] list_tables 失败: code={resp.code} msg={resp.msg}")
         return [
@@ -49,7 +50,7 @@ class BitableService:
             .table_id(table_id)
             .build()
         )
-        resp = await self.lark_api.bitable.v1.app_table_field.alist(req)
+        resp = await get_active_lark_api(self.lark_api).bitable.v1.app_table_field.alist(req)
         if not resp.success():
             raise RuntimeError(f"[Bitable] list_fields 失败: code={resp.code} msg={resp.msg}")
         return [
@@ -81,7 +82,7 @@ class BitableService:
             if page_token:
                 builder = builder.page_token(page_token)
 
-            resp = await self.lark_api.bitable.v1.app_table_record.alist(builder.build())
+            resp = await get_active_lark_api(self.lark_api).bitable.v1.app_table_record.alist(builder.build())
             if not resp.success():
                 raise RuntimeError(
                     f"[Bitable] list_records 失败: code={resp.code} msg={resp.msg}"
@@ -134,7 +135,7 @@ class BitableService:
             .request_body(body)
             .build()
         )
-        resp = await self.lark_api.bitable.v1.app_table_record.acreate(req)
+        resp = await get_active_lark_api(self.lark_api).bitable.v1.app_table_record.acreate(req)
         if not resp.success():
             raise RuntimeError(
                 f"[Bitable] create_record 失败: code={resp.code} msg={resp.msg}"
@@ -154,7 +155,7 @@ class BitableService:
             .request_body(body)
             .build()
         )
-        resp = await self.lark_api.bitable.v1.app_table_record.aupdate(req)
+        resp = await get_active_lark_api(self.lark_api).bitable.v1.app_table_record.aupdate(req)
         if not resp.success():
             raise RuntimeError(
                 f"[Bitable] update_record 失败: code={resp.code} msg={resp.msg}"
