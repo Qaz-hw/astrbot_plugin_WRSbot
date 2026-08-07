@@ -65,7 +65,15 @@ class MyPlugin(Star):
             for platform in get_insts():
                 if hasattr(platform, "lark_api"):
                     lark_apis.append(platform.lark_api)
-                    if getattr(platform, "platform_id", "") == startup_platform_id:
+                    # AstrBot v4.26 stores a platform instance's configured
+                    # ID in its config dict, not as platform.platform_id.
+                    platform_config = getattr(platform, "config", {})
+                    platform_id = (
+                        platform_config.get("id", "")
+                        if isinstance(platform_config, dict)
+                        else getattr(platform, "platform_id", "")
+                    )
+                    if platform_id == startup_platform_id:
                         startup_lark_apis.append(platform.lark_api)
 
         if startup_lark_apis:
@@ -123,33 +131,68 @@ class MyPlugin(Star):
 #==============================================================
 
 
-    @filter.command("Hello")
+    @filter.regex(r"^(hello|Hello|HELLO|你好|您好)$")
     async def cmd_send_wrs_welcome(self, event: AstrMessageEvent):
-        """Send Welcome lark card to users"""
+        """
+        Send WRSbot welcome Lark card when user greets the bot.
+        Trigger:
+            hello
+            Hello
+            HELLO
+           你好
+           您好
+        """
+
+        # Only support Lark / Feishu
         from astrbot.core.platform.sources.lark.lark_event import LarkMessageEvent
 
         if not isinstance(event, LarkMessageEvent):
-            yield event.plain_result("This command is only abled on Lark/Feishu")
+            yield event.plain_result(
+                "This command is only available on Lark/Feishu"
+            )
             return
 
-        self.card_service.bind_lark_api(event.get_sender_id(), event.bot)
-        self.contact_service.bind_lark_api(event.get_sender_id(), event.bot)
-        set_active_lark_api(event.bot)
-        # Reply in the incoming conversation rather than starting a new DM by
-        # open_id.  This avoids Feishu's "open_id cross app" error.
-        await self.card_service.send_wrsbot_welcome(
-            open_id=event.get_sender_id(),
-            reply_message_id=event.message_obj.message_id,
-            lark_api=event.bot,
-        )
-        event._has_send_oper = True
+        try:
+            # Bind current Lark bot instance
+            self.card_service.bind_lark_api(
+                event.get_sender_id(),
+                event.bot
+            )
+
+            self.contact_service.bind_lark_api(
+                event.get_sender_id(),
+                event.bot
+            )
+
+            # Send card by replying to current message
+            # Avoid Feishu open_id cross-app issue
+            await self.card_service.send_wrsbot_welcome(
+                open_id=event.get_sender_id(),
+                reply_message_id=event.message_obj.message_id,
+                lark_api=event.bot,
+            )
+
+            # Tell AstrBot that this event already has a response
+            event._has_send_oper = True
+
+        except Exception as e:
+            import traceback
+
+            traceback.print_exc()
+
+            yield event.plain_result(
+                f"WRSbot welcome failed: {str(e)}"
+            )
 
     @filter.command("文件夹配置")
     async def cmd_folder_config(self, event: AstrMessageEvent):
-        """检查当前用户的部门文件夹绑定状态，发送对应的反馈卡片。
+        """Show the caller's folder-binding status card.
 
-        - 全部部门已绑定 → send_binding_success_card
-        - 否则（含非管理员、未绑定、部分未绑定）→ send_not_binding_card
+        ``send_not_binding_card`` is intentionally the sole renderer here:
+        its internal state builder returns either the bound or unbound card
+        from one managed-department snapshot.  Do not pre-check
+        ``is_fully_bound`` here, because a second lookup can race a contact
+        cache refresh and produce mismatched status/name values.
         """
         from astrbot.core.platform.sources.lark.lark_event import LarkMessageEvent
 
@@ -162,18 +205,11 @@ class MyPlugin(Star):
         self.contact_service.bind_lark_api(open_id, event.bot)
         set_active_lark_api(event.bot)
         reply_message_id = event.message_obj.message_id
-        if self.card_service.is_fully_bound(open_id):
-            await self.card_service.send_binding_success_card(
-                open_id,
-                lark_api=event.bot,
-                reply_message_id=reply_message_id,
-            )
-        else:
-            await self.card_service.send_not_binding_card(
-                open_id,
-                lark_api=event.bot,
-                reply_message_id=reply_message_id,
-            )
+        await self.card_service.send_not_binding_card(
+            open_id,
+            lark_api=event.bot,
+            reply_message_id=reply_message_id,
+        )
         event._has_send_oper = True
 
     @filter.command("清除所有绑定")

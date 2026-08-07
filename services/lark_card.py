@@ -48,7 +48,6 @@ ALERT_RESOLVED_CARD_ID = os.getenv("ALERT_RESOLVED_CARD_ID", "AAqtuTeLM56jm")
 # Set via environment variables. Default values are test card IDs.
 WRSBOT_WELCOME_CARD_ID = os.getenv("WRSBOT_WELCOME_CARD_ID", "AAqWG7tpchJNE")
 WRSBOT_COMMAND_LIST_ID = os.getenv("WRSBOT_COMMAND_LIST_ID", "AAqWG7LYdWWZ8")
-
 WRSBOT_BINDFOLDER_TUTORIAL_CARD_ID = os.getenv("WRSBOT_BINDFOLDER_TUTORIAL_CARD_ID", "AAqWGzF0skSTw")
 WRSBOT_BINDING_FEEDBACK_SUCCESS_CARD_ID = os.getenv("WRSBOT_BINDING_FEEDBACK_SUCCESS_CARD_ID", "AAqtVxQCOa3D8")
 WRSBOT_NOT_BINDiNG_FEEDBACK_CARD_ID = os.getenv("WRSBOT_NOT_BINDiNG_FEEDBACK_CARD_ID", "AAqWGzef64dV3")
@@ -58,8 +57,11 @@ WRSBOT_CARD_USER_VIEW_ID = os.getenv("WRSBOT_CARD_USER_VIEW_ID", "AAqWGzJx4vkWm"
 WRSBOT_SUMMARY_REWRITE_CARD_ID = os.getenv("WRSBOT_SUMMARY_REWRITE_CARD_ID", "AAqWGzI8irmU6")
 WRSBOT_STYLE_CONFIG_CARD_ID = os.getenv("WRSBOT_STYLE_CONFIG_CARD_ID", "AAqWGzaxnlUyj")
 
-
-
+# ──PMbot cards template IDs ────────────────────────────────────────────────────────
+PMBOT_DAILY_REPORT_PM_UPDATE = os.getenv("PMBOT_DAILY_REPORT_PM_UPDATE", "AAqWlcPrTPRtx")
+PMBOT_DAILY_REPORT_BINDING_CARD_ID = os.getenv(
+    "PMBOT_DAILY_REPORT_BINDING_CARD_ID", "AAqWl8hXjOWeZ"
+)
 
 class LarkCardService:
     def __init__(self, lark_api):
@@ -256,6 +258,121 @@ class LarkCardService:
                         "template_variable": {"open_id": open_id},
                     },
                 }
+            })
+
+        # ── PMbot welcome card action ────────────────────────────────────────────
+        # PMbot stores its daily-report folder separately from WRSbot's weekly
+        # report folder.  The daily binding card is shown until that folder exists.
+        if action_key == "PMbot_start":
+            logger.info("[Lark_card] PMbot 开始使用")
+            from ..utils.env_config import get_dept_daily_report_folder_token
+
+            managed = self._get_managed_depts(open_id)
+            if not managed:
+                return P2CardActionTriggerResponse({
+                    "toast": {
+                        "type": "error",
+                        "content": "未找到您管理的部门，无法绑定日报文件夹",
+                        "i18n": {"zh_cn": "未找到您管理的部门，无法绑定日报文件夹"},
+                    }
+                })
+
+            dept = managed[0]["dept"]
+            dept_id = getattr(dept, "open_department_id", "") or ""
+            if not get_dept_daily_report_folder_token(dept_id):
+                return P2CardActionTriggerResponse({
+                    "card": {
+                        "type": "template",
+                        "data": {
+                            "template_id": PMBOT_DAILY_REPORT_BINDING_CARD_ID,
+                            "template_variable": {
+                                "open_id": open_id,
+                                "dept_id": dept_id,
+                                "dept_name": dept.name or "",
+                            },
+                        },
+                    }
+                })
+
+            return P2CardActionTriggerResponse({
+                "card": {
+                    "type": "template",
+                    "data": {
+                        "template_id": PMBOT_DAILY_REPORT_PM_UPDATE,
+                        "template_variable": {"open_id": open_id},
+                    },
+                }
+            })
+
+        # ── PMbot daily-report folder binding ───────────────────────────────────
+        # The PMbot binding card (AAqWl8hXjOWeZ) submits this action.  It saves to
+        # DEPT_DAILY_REPORT_FOLDER_<department-id>, never DEPT_FOLDER_<...>, so
+        # daily-report binding cannot overwrite the existing weekly-report folder.
+        # Supported card input names: daily_report_folder_url_input (preferred)
+        # and folder_url_input (compatible with the existing weekly-card field).
+        if action_key == "bind_new_token_dr":
+            logger.info("[Lark_card] PMbot 绑定日报文件夹")
+            from ..utils.env_config import (
+                extract_folder_token_from_url,
+                set_dept_daily_report_folder_token,
+            )
+
+            form_value: dict = action.form_value or {} if action is not None else {}
+            url = str(
+                form_value.get("daily_report_folder_url_input")
+                or form_value.get("folder_url_input")
+                or ""
+            ).strip()
+            dept_id = str(action_value.get("dept_id", "") or "")
+
+            if not dept_id:
+                managed = self._get_managed_depts(open_id)
+                if managed:
+                    dept_id = getattr(managed[0]["dept"], "open_department_id", "") or ""
+
+            if not url:
+                return P2CardActionTriggerResponse({
+                    "toast": {
+                        "type": "error",
+                        "content": "请粘贴日报文件夹链接",
+                        "i18n": {"zh_cn": "请粘贴日报文件夹链接"},
+                    }
+                })
+
+            token = extract_folder_token_from_url(url)
+            if not token:
+                return P2CardActionTriggerResponse({
+                    "toast": {
+                        "type": "error",
+                        "content": "链接格式不正确，请粘贴飞书文件夹链接",
+                        "i18n": {"zh_cn": "链接格式不正确，请粘贴飞书文件夹链接"},
+                    }
+                })
+
+            if not dept_id:
+                return P2CardActionTriggerResponse({
+                    "toast": {
+                        "type": "error",
+                        "content": "无法确定绑定部门，请联系管理员",
+                        "i18n": {"zh_cn": "无法确定绑定部门，请联系管理员"},
+                    }
+                })
+
+            set_dept_daily_report_folder_token(dept_id, token)
+            logger.info(f"[Lark_card] PMbot 日报文件夹绑定成功: dept={dept_id} token={token}")
+            return P2CardActionTriggerResponse({
+                "toast": {
+                    "type": "success",
+                    "content": "日报文件夹绑定成功！",
+                    "i18n": {"zh_cn": "日报文件夹绑定成功！"},
+                },
+                "card": {
+                    "type": "template",
+                    "data": {
+                        "template_id": PMBOT_DAILY_REPORT_PM_UPDATE,
+                        "template_variable": {"open_id": open_id},
+                    },
+                },
             })
 
         # Renders the command list card, tailored to the user's role.
@@ -1403,39 +1520,21 @@ class LarkCardService:
         }
 
     def _binding_card_dept_name(self, open_id: str, default_name: str) -> str:
-        """Choose the department label used by a binding-status template.
+        """Return the same department label that the binding action targets.
 
-        The temporary test-admin override can grant a user manager access to
-        a fallback department while their actual Feishu membership remains in
-        another department.  For that one testing route, show the membership
-        department so the binding card agrees with the submission dashboard.
-        This changes presentation only: binding actions still target the
-        managed department selected by the existing binding flow.
+        ContactService already resolves a test administrator's explicit
+        manager override.  The card must use that managed-department label,
+        rather than substituting the user's ordinary membership department.
         """
-        if not self.contact_service or not self.contact_service.is_test_admin(open_id):
-            return default_name
-
-        for entry in self.contact_service.get_cached_org_tree_sync(open_id):
-            if any(
-                getattr(member, "open_id", None) == open_id
-                for member in entry.get("members", [])
-            ):
-                member_dept_name = entry["dept"].name or default_name
-                logger.info(
-                    f"[Lark_card] 测试管理员绑定卡片使用成员部门名称: "
-                    f"open_id={open_id} dept={member_dept_name} "
-                    f"managed_dept={default_name}"
-                )
-                return member_dept_name
-
         return default_name
 
     def _build_not_binding_card_data(self, open_id: str, *, failed: bool = False) -> dict:
         """Return the card 'type'+'data' dict for the binding status card.
 
-        Single dept → template card (card builder) with computed variables.
-        Multi dept  → inline JSON card with one row per department.
-        All bound + not failed → success card instead.
+        All-bound departments use the published success template. Any unbound
+        or failed state uses an inline card so the visible status is generated
+        from the same folder-token lookup as the backend, rather than relying
+        on a Card Builder template's static/default status text.
         """
         from ..utils.env_config import get_dept_folder_token
 
@@ -1474,29 +1573,10 @@ class LarkCardService:
                 },
             }
 
-        if len(managed) == 1:
-            dept = managed[0]["dept"]
-            open_dept_id = getattr(dept, "open_department_id", "") or ""
-            token = get_dept_folder_token(open_dept_id)
-            is_bound = bool(token)
-            colour = "red" if failed else ("green" if is_bound else "orange")
-            status = "绑定失败" if failed else ("已绑定" if is_bound else "未绑定")
-            return {
-                "type": "template",
-                "data": {
-                    "template_id": WRSBOT_NOT_BINDiNG_FEEDBACK_CARD_ID,
-                    "template_variable": {
-                        "dept_name": self._binding_card_dept_name(open_id, dept.name or ""),
-                        "dept_num": 1,
-                        "unreg_dept_num": 0 if (is_bound and not failed) else 1,
-                        "binding_status": status,
-                        "heading_colour_code": colour,
-                        "doc_is_not_binded": not is_bound,
-                    },
-                },
-            }
-
-        return {"type": "raw", "data": _build_multi_dept_binding_card(managed)}
+        return {
+            "type": "raw",
+            "data": _build_multi_dept_binding_card(managed, failed=failed),
+        }
 
     # todo: write the workflow as comment
     # todo: write functionalities
@@ -1504,11 +1584,11 @@ class LarkCardService:
 
 
 
-# ── Multi-dept binding card builder ─────────────────────────────────────────
-# Used when a manager leads more than one department.
-# Builds inline JSON — one dept row per department entry.
+# ── Inline binding card builder ──────────────────────────────────────────────
+# Used for every unbound or failed binding state.
+# Builds inline JSON — one status row per managed department.
 
-def _build_multi_dept_binding_card(managed_depts: list[dict]) -> dict:
+def _build_multi_dept_binding_card(managed_depts: list[dict], *, failed: bool = False) -> dict:
     from ..utils.env_config import get_dept_folder_token
 
     dept_rows = []
@@ -1522,8 +1602,8 @@ def _build_multi_dept_binding_card(managed_depts: list[dict]) -> dict:
         if not is_bound:
             total_unbound += 1
         dept_name    = dept.name or ""
-        status_label = "已绑定" if is_bound else "未绑定"
-        colour       = "green"  if is_bound else "orange"
+        status_label = "绑定失败" if failed else ("已绑定" if is_bound else "未绑定")
+        colour       = "red" if failed else ("green" if is_bound else "orange")
 
         dept_rows.append({
             "tag": "column_set",
@@ -1590,8 +1670,8 @@ def _build_multi_dept_binding_card(managed_depts: list[dict]) -> dict:
         })
 
     total = len(managed_depts)
-    header_colour  = "green" if total_unbound == 0 else "orange"
-    header_status  = f"{total - total_unbound}/{total} 已绑定"
+    header_colour = "red" if failed else ("green" if total_unbound == 0 else "orange")
+    header_status = "绑定失败，请检查文件夹链接后重试" if failed else f"{total - total_unbound}/{total} 已绑定"
 
     return {
         "schema": "2.0",
@@ -1757,19 +1837,23 @@ _GENERATING_CARD = {
 # ── Command list strings ─────────────────────────────────────────────────────
 
 _EMPLOYEE_CMD_LIST = (
-    "• **查看我的提交状态** — 确认本周是否已提交\n"
-    "• **打开我的周报文档** — 跳转至填写页面\n"
-    "• **帮助** — 查看使用说明"
+    "• **你好** / **Hello** — 打开主菜单\n"
+    "• **开始使用** — 查看我的本周提交状态\n"
+    "• **查看本周文档** — 获取周报文件夹链接\n"
+    "• **使用帮助** — 查看使用说明"
 )
 
 _MANAGER_CMD_LIST = (
-    "• **查看团队提交情况** — 本周 N / Total 人已提交\n"
+    "• **你好** / **Hello** — 打开主菜单\n"
+    "• **/文件夹配置** — 绑定或重新绑定周报文件夹\n"
+    "• **开始使用** — 查看团队本周提交情况\n"
     "• **催交报告** — 向未提交成员发送提醒卡片\n"
     "• **生成周报总结** — 启动 LLM 汇总流程\n"
-    "• **重新生成** — 更多人提交后重跑汇总\n"
-    "• **写入飞书文档** — 将草稿写入绑定文件夹\n"
-    "• **查看我的提交状态**\n"
-    "• **帮助**"
+    "• **重新生成** — 按需要重新生成总结草稿\n"
+    "• **写入飞书文档** — 将总结写入飞书文档\n"
+    "• **个人写作风格配置** — 设置总结的写作风格\n"
+    "• **查看本周文档** — 获取周报文件夹链接\n"
+    "• **使用帮助** — 查看使用说明"
 )
 
 
@@ -1788,15 +1872,25 @@ _HELP_CARD = {
             {
                 "tag": "markdown",
                 "content": (
-                    "WRSbot 帮助部门负责人自动汇总团队周报，生成管理风格的部门周报总结。\n\n"
-                    "**基本流程**\n"
-                    "1. 管理员完成文件夹绑定配置\n"
-                    "2. 团队成员填写个人周报\n"
-                    "3. 管理员触发周报生成\n"
-                    "4. 审阅草稿后一键写入文档\n\n"
-                    "**私聊触发**\n"
-                    "直接向 WRSbot 发送 `你好` 或 `Hello` 打开主菜单。\n\n"
-                    "如需进一步帮助，请联系系统管理员。"
+                    "WRSbot 用于协助团队收集周报、查看提交进度，并由部门负责人生成周报总结。\n\n"
+                    "**使用流程**\n"
+                    "**1. 打开主菜单**\n"
+                    "在私聊中向 WRSbot 发送「你好」或「Hello」，即可打开功能菜单。\n\n"
+                    "**2. 团队成员填写周报**\n"
+                    "点击「开始使用」查看自己的提交状态。点击「查看本周文档」，机器人会私聊发送本周周报文件夹链接。"
+                    "请在对应文档或多维表格中填写本周工作内容。\n\n"
+                    "**3. 部门负责人配置文件夹**\n"
+                    "首次使用时，部门负责人发送 `/文件夹配置`，并根据卡片提示粘贴周报文件夹链接。"
+                    "请确保团队成员和机器人均有该文件夹的访问权限。\n\n"
+                    "**4. 查看提交情况**\n"
+                    "部门负责人点击「开始使用」进入周报管理页面，可查看已提交人数、成员名单及数据更新时间。\n\n"
+                    "**5. 催交与生成总结**\n"
+                    "仍有成员未提交时，可点击「催交报告」发送提醒。提交后可点击「生成周报总结」生成草稿，"
+                    "并按需要重新改写或写入飞书文档。\n\n"
+                    "**注意事项**\n"
+                    "• 周报文件必须放在已绑定的部门文件夹中。\n"
+                    "• 如果提示未绑定文件夹，请联系部门负责人完成 `/文件夹配置`。\n"
+                    "• 提交状态可能需要等待片刻更新。"
                 ),
             },
             {"tag": "hr"},

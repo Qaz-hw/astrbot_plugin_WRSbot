@@ -27,6 +27,10 @@ from astrbot.api import logger
 
 _CACHE_REFRESH_INTERVAL = 5 * 60 * 60  # 5 hours in seconds
 
+# The explicit functional-test administrator is deliberately given this
+# management context, regardless of their ordinary Feishu membership.
+_TEST_ADMIN_MANAGER_DEPT_NAME = "技术部"
+
 
 class ContactService:
     def __init__(self, lark_api):
@@ -93,31 +97,29 @@ class ContactService:
         if managed or open_id not in self._test_admin_open_ids:
             return managed
 
-        # Temporary functional-test route: use the test user's actual Feishu
-        # membership department as their manager context.  This keeps the
-        # folder binding, management dashboard, and submission-card member
-        # list aligned.  Real department leaders always use the branch above.
-        member_dept = next(
+        # Temporary functional-test route: the configured test administrator
+        # manages 技术部.  Do not derive this from the user's ordinary Feishu
+        # membership — that membership can be AI产品应用 and is unrelated to
+        # the explicit manager override.
+        override_dept = next(
             (
                 entry for entry in org_tree
-                if any(
-                    getattr(member, "open_id", None) == open_id
-                    for member in entry.get("members", [])
-                )
+                if (getattr(entry.get("dept"), "name", "") or "").strip()
+                == _TEST_ADMIN_MANAGER_DEPT_NAME
             ),
             None,
         )
-        if member_dept:
-            dept = member_dept["dept"]
+        if override_dept:
+            dept = override_dept["dept"]
             logger.warning(
-                f"[Contact] 临时测试管理员使用成员部门作为管理上下文: "
+                f"[Contact] 临时测试管理员使用指定部门作为管理上下文: "
                 f"open_id={open_id} dept={dept.name or ''} "
                 f"open_dept_id={getattr(dept, 'open_department_id', '') or ''}"
             )
-            return [member_dept]
+            return [override_dept]
 
-        # If membership data is unavailable, retain the old fallback so the
-        # test route remains usable while the contact cache is incomplete.
+        # If the target department is not yet present in the cache, retain the
+        # old fallback so the test route remains usable while it is incomplete.
         root = next(
             (entry for entry in org_tree
              if getattr(entry.get("dept"), "open_department_id", "") == "0"),

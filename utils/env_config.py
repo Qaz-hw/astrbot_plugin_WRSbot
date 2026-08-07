@@ -32,6 +32,7 @@ from dotenv import set_key, unset_key, dotenv_values
 
 _ENV_PATH = Path(__file__).parent.parent / ".env"
 _DEPT_FOLDER_PREFIX = "DEPT_FOLDER_"
+_DEPT_DAILY_REPORT_FOLDER_PREFIX = "DEPT_DAILY_REPORT_FOLDER_"
 
 # Tenant-specific folder URL prefix. Trailing slash required. Override via
 # .env to support a different Feishu tenant subdomain or larksuite.com.
@@ -66,6 +67,23 @@ def get_dept_folder_token(open_dept_id: str) -> str | None:
 def set_dept_folder_token(open_dept_id: str, token: str) -> None:
     """Persist a folder token for a department to .env and apply to current process."""
     key = _to_env_key(open_dept_id)
+    set_key(_ENV_PATH, key, token)
+    os.environ[key] = token
+
+
+def _to_daily_report_env_key(open_dept_id: str) -> str:
+    """Return the isolated .env key for a department's PMbot daily-report folder."""
+    return _DEPT_DAILY_REPORT_FOLDER_PREFIX + open_dept_id.replace("-", "_")
+
+
+def get_dept_daily_report_folder_token(open_dept_id: str) -> str | None:
+    """Return the PMbot daily-report folder token for a department, if bound."""
+    return os.getenv(_to_daily_report_env_key(open_dept_id)) or None
+
+
+def set_dept_daily_report_folder_token(open_dept_id: str, token: str) -> None:
+    """Persist a PMbot daily-report folder token without changing weekly bindings."""
+    key = _to_daily_report_env_key(open_dept_id)
     set_key(_ENV_PATH, key, token)
     os.environ[key] = token
 
