@@ -345,32 +345,42 @@ class MyPlugin(Star):
 
     @filter.command("test_cached_feishu_contact")
     async def test_cached_feishu_contact(self, event: AstrMessageEvent):
-        """[Admin] 查看当前内存缓存中的部门树（不发起 API 请求）。"""
+        """[Admin] 查看当前内存缓存中的层级部门树（不发起 API 请求）。"""
         if not self.lark_api:
             yield event.plain_result("未找到飞书适配器，请确认当前平台为飞书。")
             return
         try:
             lark_api = getattr(event, "bot", None)
-            self.contact_service.bind_lark_api(event.get_sender_id(), lark_api)
-            org_tree = await self.contact_service.get_cached_org_tree(
+            # This command must inspect existing data only.  Do not schedule a
+            # refresh here, otherwise a cache miss races the background API call.
+            self.contact_service.bind_lark_api(
+                event.get_sender_id(), lark_api, schedule_refresh=False
+            )
+            hierarchy = await self.contact_service.get_cached_org_hierarchy(
                 event.get_sender_id(), lark_api=lark_api
             )
         except Exception as e:
-            yield event.plain_result(f"获取缓存失败: {e}")
+            yield event.plain_result(
+                "通讯录缓存尚未就绪。请等待自动缓存刷新完成后重试，"
+                "或先执行 /test_feishu_contact 进行一次实时刷新。"
+            )
             return
         yield event.plain_result(
-            self.contact_service.format_org_tree_dump(org_tree, source="缓存")
+            self.contact_service.format_org_hierarchy_dump(hierarchy, source="缓存")
         )
 
     @filter.command("dump_bindings")
     async def dump_bindings(self, event: AstrMessageEvent):
-        """[Developer] 显示所有部门文件夹绑定状态，与缓存通讯录交叉校验。"""
+        """[Developer] 显示周报及 PMbot 日报文件夹绑定状态，与通讯录交叉校验。"""
         try:
             org_tree = await self.contact_service.get_cached_org_tree(event.get_sender_id())
+            hierarchy = await self.contact_service.get_cached_org_hierarchy(
+                event.get_sender_id()
+            )
         except Exception as e:
             yield event.plain_result(f"获取缓存失败: {e}")
             return
-        yield event.plain_result(dump_dept_bindings(org_tree))
+        yield event.plain_result(dump_dept_bindings(org_tree, hierarchy))
 
     @filter.command("check_user")
     async def cmd_check_user(self, event: AstrMessageEvent):

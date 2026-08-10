@@ -31,6 +31,8 @@ class BitableService:
     def __init__(self, lark_api):
         self.lark_api = lark_api
 
+#=====================Bitable Weekly Report Summary===================================
+
     async def list_tables(self, app_token: str) -> list[dict]:
         """List all tables in a Bitable app. Returns [{table_id, name}]."""
         req = ListAppTableRequest.builder().app_token(app_token).build()
@@ -228,3 +230,6 @@ class BitableService:
                 parts.append(f"{key}: {BitableService._format_field_value(val)}")
             out.append((name, "\n".join(parts)))
         return out
+
+
+#=====================Bitable Weekly Report Summary===================================

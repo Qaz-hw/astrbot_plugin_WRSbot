@@ -16,6 +16,7 @@
 import asyncio
 import datetime
 import os
+from dataclasses import dataclass
 from types import SimpleNamespace
 
 from lark_oapi.api.contact.v3 import (
@@ -32,6 +33,26 @@ _CACHE_REFRESH_INTERVAL = 5 * 60 * 60  # 5 hours in seconds
 _TEST_ADMIN_MANAGER_DEPT_NAME = "技术部"
 
 
+@dataclass(frozen=True)
+class OrgDepartmentNode:
+    """A department plus its direct parent, children, manager, and members."""
+
+    dept: object
+    manager: object | None
+    members: tuple[object, ...]
+    parent_department_id: str | None
+    child_department_ids: tuple[str, ...]
+
+
+@dataclass(frozen=True)
+class OrgHierarchySnapshot:
+    """App-scoped indexed organization hierarchy produced by one refresh."""
+
+    nodes_by_department_id: dict[str, OrgDepartmentNode]
+    root_department_ids: tuple[str, ...]
+    department_ids_by_member: dict[str, tuple[str, ...]]
+
+
 class ContactService:
     def __init__(self, lark_api):
         self.lark_api = lark_api
@@ -40,6 +61,9 @@ class ContactService:
         # organization tree with every app in this AstrBot process.
         self._lark_api_by_open_id: dict[str, object] = {}
         self._org_tree_cache_by_api: dict[int, list[dict]] = {}
+        # Kept alongside the legacy flat cache until callers are migrated to
+        # hierarchy-aware queries.
+        self._org_hierarchy_cache_by_api: dict[int, OrgHierarchySnapshot] = {}
         self._leader_ids_by_api: dict[int, frozenset[str]] = {}
         # Temporary local override for functional testing.  Lark delivers an
         # app-scoped open_id rather than a reliable display name in events.
@@ -78,6 +102,13 @@ class ContactService:
         """Synchronous cache read for card-action handlers."""
         api = self._resolve_lark_api(open_id, lark_api)
         return self._org_tree_cache_by_api.get(self._api_key(api), [])
+
+    def get_cached_org_hierarchy_sync(
+        self, open_id: str = "", lark_api=None
+    ) -> OrgHierarchySnapshot | None:
+        """Return the hierarchy cache for this Lark app, if it is ready."""
+        api = self._resolve_lark_api(open_id, lark_api)
+        return self._org_hierarchy_cache_by_api.get(self._api_key(api))
 
     def is_manager(self, open_id: str) -> bool:
         """Synchronous role check — safe to call from card action handlers."""
@@ -305,6 +336,41 @@ class ContactService:
             lines.append("未找到任何部门，请确认应用通讯录权限已授权。")
         return "\n".join(lines)
 
+    @staticmethod
+    def format_org_hierarchy_dump(
+        hierarchy: OrgHierarchySnapshot, source: str = "cached"
+    ) -> str:
+        """Format the cached parent/child hierarchy for developer inspection."""
+        nodes = hierarchy.nodes_by_department_id
+        lines = [f"══ 飞书通讯录（{source}，层级部门共 {len(nodes)} 个）══", ""]
+        visited: set[str] = set()
+
+        def append_node(department_id: str, prefix: str, is_last: bool) -> None:
+            if department_id in visited:
+                lines.append(f"{prefix}{'└─' if is_last else '├─'} [循环引用] {department_id}")
+                return
+            visited.add(department_id)
+            node = nodes[department_id]
+            dept = node.dept
+            connector = "└─" if is_last else "├─"
+            manager_name = getattr(node.manager, "name", "") or "未设置"
+            lines.append(
+                f"{prefix}{connector} 📁 {getattr(dept, 'name', '') or department_id} "
+                f"(负责人: {manager_name}，直属成员: {len(node.members)})"
+            )
+            child_prefix = prefix + ("   " if is_last else "│  ")
+            for index, child_id in enumerate(node.child_department_ids):
+                append_node(child_id, child_prefix, index == len(node.child_department_ids) - 1)
+
+        for index, department_id in enumerate(hierarchy.root_department_ids):
+            append_node(department_id, "", index == len(hierarchy.root_department_ids) - 1)
+        for department_id in nodes:
+            if department_id not in visited:
+                append_node(department_id, "", True)
+        if not nodes:
+            lines.append("未找到任何部门，请确认应用通讯录权限已授权。")
+        return "\n".join(lines)
+
     # ── Org tree cache ───────────────────────────────────────────────────────
 
     async def get_cached_org_tree(self, open_id: str = "", *, lark_api=None) -> list[dict]:
@@ -316,6 +382,81 @@ class ContactService:
                 raise RuntimeError("Org tree cache not initialized yet")
             return cached
 
+    async def get_cached_org_hierarchy(
+        self, open_id: str = "", *, lark_api=None
+    ) -> OrgHierarchySnapshot:
+        """Return the hierarchy cached for this Lark app."""
+        async with self._cache_lock:
+            api = self._resolve_lark_api(open_id, lark_api)
+            cached = self._org_hierarchy_cache_by_api.get(self._api_key(api))
+            if cached is None:
+                raise RuntimeError("Org hierarchy cache not initialized yet")
+            return cached
+
+    @staticmethod
+    def _build_org_hierarchy(org_tree: list[dict]) -> OrgHierarchySnapshot:
+        """Build parent/child and member indexes from the legacy flat tree.
+
+        The public hierarchy key is ``open_department_id``.  Feishu sometimes
+        returns a parent using its internal ``department_id``, so both IDs are
+        indexed while resolving parent links.
+        """
+        pending: dict[str, tuple[dict, str | None]] = {}
+        aliases: dict[str, str] = {}
+        for entry in org_tree:
+            dept = entry["dept"]
+            department_id = (
+                getattr(dept, "open_department_id", "")
+                or getattr(dept, "department_id", "")
+            )
+            if not department_id or department_id in pending:
+                continue
+            raw_parent_id = getattr(dept, "parent_department_id", "") or None
+            pending[department_id] = (entry, raw_parent_id)
+            aliases[department_id] = department_id
+            internal_id = getattr(dept, "department_id", "") or ""
+            if internal_id:
+                aliases.setdefault(internal_id, department_id)
+
+        child_ids: dict[str, list[str]] = {department_id: [] for department_id in pending}
+        parents: dict[str, str | None] = {}
+        root_ids: list[str] = []
+        for department_id, (_, raw_parent_id) in pending.items():
+            parent_id = aliases.get(raw_parent_id or "")
+            # "0" is the virtual organization root. Missing or unknown
+            # parents are safely shown as roots rather than hidden.
+            if raw_parent_id == "0" or not parent_id or parent_id == department_id:
+                parents[department_id] = None
+                root_ids.append(department_id)
+            else:
+                parents[department_id] = parent_id
+                child_ids[parent_id].append(department_id)
+
+        memberships: dict[str, list[str]] = {}
+        nodes: dict[str, OrgDepartmentNode] = {}
+        for department_id, (entry, _) in pending.items():
+            members = tuple(entry.get("members") or [])
+            for member in members:
+                member_open_id = getattr(member, "open_id", "") or ""
+                if member_open_id:
+                    memberships.setdefault(member_open_id, []).append(department_id)
+            nodes[department_id] = OrgDepartmentNode(
+                dept=entry["dept"],
+                manager=entry.get("manager"),
+                members=members,
+                parent_department_id=parents[department_id],
+                child_department_ids=tuple(child_ids[department_id]),
+            )
+
+        return OrgHierarchySnapshot(
+            nodes_by_department_id=nodes,
+            root_department_ids=tuple(root_ids),
+            department_ids_by_member={
+                member_id: tuple(department_ids)
+                for member_id, department_ids in memberships.items()
+            },
+        )
+
     async def _do_refresh(self, open_id: str = "", *, lark_api=None) -> None:
         """Fetch a fresh org tree and replace the cache under the lock."""
         logger.info("[Contact] 开始刷新部门缓存...")
@@ -325,6 +466,7 @@ class ContactService:
         except Exception as e:
             logger.error(f"[Contact] 部门缓存刷新失败: {e}")
             return
+        hierarchy = self._build_org_hierarchy(fresh)
         leader_ids = frozenset(
             e["manager"].open_id
             for e in fresh
@@ -333,6 +475,7 @@ class ContactService:
         async with self._cache_lock:
             key = self._api_key(api)
             self._org_tree_cache_by_api[key] = fresh
+            self._org_hierarchy_cache_by_api[key] = hierarchy
             self._leader_ids_by_api[key] = leader_ids
         dept_count   = len(fresh)
         member_count = sum(len(e["members"]) for e in fresh)

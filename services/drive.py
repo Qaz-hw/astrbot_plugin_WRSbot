@@ -135,7 +135,7 @@ class DriveService:
         """Find this week's report file in a folder.
 
         Strategy:
-          1. List all files in the folder.
+          1. List all files in the folder
           2. Try rule-based name matching (ISO week / date range).
           3. If no match and llm_fn is provided, ask the LLM to pick from the name list.
              llm_fn receives a list[str] of file names and must return the best-match

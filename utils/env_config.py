@@ -57,6 +57,12 @@ def _from_env_key(env_key: str) -> str:
     return raw.replace("_", "-", 1)
 
 
+def _from_daily_report_env_key(env_key: str) -> str:
+    """Reverse a PMbot daily-report folder key back to department ID."""
+    raw = env_key[len(_DEPT_DAILY_REPORT_FOLDER_PREFIX):]
+    return raw.replace("_", "-", 1)
+
+
 # ── Public API ───────────────────────────────────────────────────────────────
 
 def get_dept_folder_token(open_dept_id: str) -> str | None:
@@ -164,41 +170,103 @@ def list_all_dept_bindings() -> list[dict]:
     ]
 
 
+def list_all_dept_daily_report_bindings() -> list[dict]:
+    """Return every PMbot daily-report folder binding stored in the environment."""
+    return [
+        {
+            "env_key": key,
+            "open_dept_id": _from_daily_report_env_key(key),
+            "folder_token": val,
+        }
+        for key, val in os.environ.items()
+        if key.startswith(_DEPT_DAILY_REPORT_FOLDER_PREFIX) and val
+    ]
+
+
 # ── Dev display ──────────────────────────────────────────────────────────────
 
-def dump_dept_bindings(org_tree: list[dict]) -> str:
-    """Format all dept→folder bindings cross-referenced with org tree names.
+def dump_dept_bindings(org_tree: list[dict], hierarchy=None) -> str:
+    """Format a hierarchy-aware weekly/daily binding diagnostic.
 
-    Intended for developer terminal checks via bot command.
-    org_tree: output of ContactService.get_cached_org_tree()
+    ``hierarchy`` is ContactService's cached OrgHierarchySnapshot.  The flat
+    fallback keeps this developer command useful before a new cache refresh.
     """
-    dept_name_map: dict[str, str] = {}
-    for entry in org_tree:
-        dept = entry["dept"]
-        open_id = getattr(dept, "open_department_id", "") or ""
-        if open_id:
-            dept_name_map[open_id] = dept.name or open_id
+    if hierarchy:
+        nodes = hierarchy.nodes_by_department_id
+        root_ids = hierarchy.root_department_ids
+    else:
+        nodes = {}
+        root_ids = []
+        for entry in org_tree:
+            dept = entry["dept"]
+            department_id = getattr(dept, "open_department_id", "") or ""
+            if department_id:
+                nodes[department_id] = entry
+                root_ids.append(department_id)
 
-    lines = ["══ 部门文件夹绑定状态 ══", ""]
+    all_ids = set(nodes)
+    weekly_bound = sum(bool(get_dept_folder_token(dept_id)) for dept_id in all_ids)
+    daily_bound = sum(bool(get_dept_daily_report_folder_token(dept_id)) for dept_id in all_ids)
+    total = len(all_ids)
+    lines = [
+        "══ 部门文件夹绑定状态（组织树）══",
+        f"部门: {total} | 周报: {weekly_bound}/{total} | 日报: {daily_bound}/{total}",
+        "图例: WR=周报文件夹 | DR=PMbot 日报文件夹",
+        "",
+    ]
 
-    bound = list_all_dept_bindings()
-    bound_ids = {b["open_dept_id"] for b in bound}
+    def _entry_parts(department_id: str):
+        node = nodes[department_id]
+        if hierarchy:
+            return node.dept, node.manager, node.child_department_ids
+        return node["dept"], node.get("manager"), ()
 
-    for entry in org_tree:
-        dept = entry["dept"]
-        open_id = getattr(dept, "open_department_id", "") or ""
-        token = get_dept_folder_token(open_id)
-        status = f"✅ {token}" if token else "❌ 未绑定"
-        lines.append(f"{dept.name:<20s}  →  {status}")
+    def _binding_text(token: str | None) -> str:
+        return f"✅ {token}" if token else "❌ 未绑定"
 
-    orphans = [b for b in bound if b["open_dept_id"] not in dept_name_map]
-    if orphans:
-        lines.append("")
-        lines.append("── 孤立绑定（部门已不在通讯录中）──")
-        for b in orphans:
-            lines.append(f"{b['open_dept_id']}  →  {b['folder_token']}")
+    visited: set[str] = set()
 
-    if not org_tree:
+    def _append_branch(department_id: str, prefix: str, is_last: bool) -> None:
+        if department_id in visited:
+            lines.append(f"{prefix}{'└─' if is_last else '├─'} [循环引用] {department_id}")
+            return
+        visited.add(department_id)
+        dept, manager, child_ids = _entry_parts(department_id)
+        name = getattr(dept, "name", "") or department_id
+        manager_name = getattr(manager, "name", "") or "未设置"
+        weekly = _binding_text(get_dept_folder_token(department_id))
+        daily = _binding_text(get_dept_daily_report_folder_token(department_id))
+        connector = "└─" if is_last else "├─"
+        lines.append(
+            f"{prefix}{connector} {name}  [负责人: {manager_name}]\n"
+            f"{prefix}{'   ' if is_last else '│  '}   WR {weekly} | DR {daily}"
+        )
+        child_prefix = prefix + ("   " if is_last else "│  ")
+        for index, child_id in enumerate(child_ids):
+            _append_branch(child_id, child_prefix, index == len(child_ids) - 1)
+
+    for index, department_id in enumerate(root_ids):
+        _append_branch(department_id, "", index == len(root_ids) - 1)
+
+    # Defensive fallback: show any node omitted by malformed parent data.
+    for department_id in all_ids - visited:
+        _append_branch(department_id, "", True)
+
+    weekly_orphans = [
+        binding for binding in list_all_dept_bindings()
+        if binding["open_dept_id"] not in all_ids
+    ]
+    daily_orphans = [
+        binding for binding in list_all_dept_daily_report_bindings()
+        if binding["open_dept_id"] not in all_ids
+    ]
+    if weekly_orphans or daily_orphans:
+        lines.extend(["", "── 孤立绑定（不在当前通讯录）──"])
+        for binding in weekly_orphans:
+            lines.append(f"WR {binding['open_dept_id']} → {binding['folder_token']}")
+        for binding in daily_orphans:
+            lines.append(f"DR {binding['open_dept_id']} → {binding['folder_token']}")
+
+    if not all_ids:
         lines.append("通讯录缓存尚未加载，无法交叉验证。")
-
     return "\n".join(lines)

@@ -50,7 +50,7 @@ WRSBOT_WELCOME_CARD_ID = os.getenv("WRSBOT_WELCOME_CARD_ID", "AAqWG7tpchJNE")
 WRSBOT_COMMAND_LIST_ID = os.getenv("WRSBOT_COMMAND_LIST_ID", "AAqWG7LYdWWZ8")
 WRSBOT_BINDFOLDER_TUTORIAL_CARD_ID = os.getenv("WRSBOT_BINDFOLDER_TUTORIAL_CARD_ID", "AAqWGzF0skSTw")
 WRSBOT_BINDING_FEEDBACK_SUCCESS_CARD_ID = os.getenv("WRSBOT_BINDING_FEEDBACK_SUCCESS_CARD_ID", "AAqtVxQCOa3D8")
-WRSBOT_NOT_BINDiNG_FEEDBACK_CARD_ID = os.getenv("WRSBOT_NOT_BINDiNG_FEEDBACK_CARD_ID", "AAqWGzef64dV3")
+WRSBOT_NOT_BINDiNG_FEEDBACK_CARD_ID = os.getenv("WRSBOT_NOT_BINDiNG_FEEDBACK_CARD_ID", "AAqWGz3aB4KYM")
 WRSBOT_ADMIN_VIEW_CARD_ID = os.getenv("WRSBOT_ADMIN_VIEW_CARD_ID", "AAqWGzpYUSdDc")
 WRSBOT_ADMIN_REPORT_SUMMARY_CHECK_CARD_ID = os.getenv("WRSBOT_ADMIN_REPORT_SUMMARY_CHECK_CARD_ID", "AAqtVXND6ex3t") #Report Submission check. triggered when starting weekly report summary when not everyone in the department is submitted their report 
 WRSBOT_CARD_USER_VIEW_ID = os.getenv("WRSBOT_CARD_USER_VIEW_ID", "AAqWGzJx4vkWm")
@@ -59,9 +59,8 @@ WRSBOT_STYLE_CONFIG_CARD_ID = os.getenv("WRSBOT_STYLE_CONFIG_CARD_ID", "AAqWGzax
 
 # ──PMbot cards template IDs ────────────────────────────────────────────────────────
 PMBOT_DAILY_REPORT_PM_UPDATE = os.getenv("PMBOT_DAILY_REPORT_PM_UPDATE", "AAqWlcPrTPRtx")
-PMBOT_DAILY_REPORT_BINDING_CARD_ID = os.getenv(
-    "PMBOT_DAILY_REPORT_BINDING_CARD_ID", "AAqWl8hXjOWeZ"
-)
+PMBOT_DAILY_REPORT_BINDING_CARD_ID = os.getenv("PMBOT_DAILY_REPORT_BINDING_CARD_ID", "AAqWl8hXjOWeZ")
+# WRSBOT_BINDFOLDER_TUTORIAL_CARD_ID = os.getenv("WRSBOT_BINDFOLDER_TUTORIAL_CARD_ID", "AAqPYaf47fxzP")
 
 class LarkCardService:
     def __init__(self, lark_api):
@@ -267,24 +266,55 @@ class LarkCardService:
             logger.info("[Lark_card] PMbot 开始使用")
             from ..utils.env_config import get_dept_daily_report_folder_token
 
-            managed = self._get_managed_depts(open_id)
-            if not managed:
+            is_admin = self.contact_service is not None and self.contact_service.is_manager(open_id)
+            if not is_admin:
                 return P2CardActionTriggerResponse({
                     "toast": {
                         "type": "error",
-                        "content": "未找到您管理的部门，无法绑定日报文件夹",
-                        "i18n": {"zh_cn": "未找到您管理的部门，无法绑定日报文件夹"},
+                        "content": "仅部门负责人可以使用 PMbot",
+                        "i18n": {"zh_cn": "仅部门负责人可以使用 PMbot"},
                     }
                 })
 
-            dept = managed[0]["dept"]
-            dept_id = getattr(dept, "open_department_id", "") or ""
-            if not get_dept_daily_report_folder_token(dept_id):
+            managed = self._get_managed_depts(open_id)
+            all_bound = bool(managed) and all(
+                bool(
+                    get_dept_daily_report_folder_token(
+                        getattr(entry["dept"], "open_department_id", "") or ""
+                    )
+                )
+                for entry in managed
+            )
+
+            if not all_bound:
+                # Like WRSbot's start gate, bind the first missing department
+                # before entering the main PMbot card.  The daily binding uses
+                # its own token namespace and cannot affect weekly bindings.
+                unbound = next(
+                    (
+                        entry for entry in managed
+                        if not get_dept_daily_report_folder_token(
+                            getattr(entry["dept"], "open_department_id", "") or ""
+                        )
+                    ),
+                    None,
+                )
+                if not unbound:
+                    return P2CardActionTriggerResponse({
+                        "toast": {
+                            "type": "error",
+                            "content": "未找到您管理的部门，无法绑定日报文件夹",
+                            "i18n": {"zh_cn": "未找到您管理的部门，无法绑定日报文件夹"},
+                        }
+                    })
+
+                dept = unbound["dept"]
+                dept_id = getattr(dept, "open_department_id", "") or ""
                 return P2CardActionTriggerResponse({
                     "card": {
                         "type": "template",
                         "data": {
-                            "template_id": PMBOT_DAILY_REPORT_BINDING_CARD_ID,
+                            "template_id": WRSBOT_NOT_BINDiNG_FEEDBACK_CARD_ID,
                             "template_variable": {
                                 "open_id": open_id,
                                 "dept_id": dept_id,
@@ -477,23 +507,26 @@ class LarkCardService:
                 }
             })
 
-        # Handles the URL submission from the tutorial card's folder URL input field.
-        # folder_url_input: key of the input element in the card builder — must match exactly.
-        # url:     the raw Feishu folder URL pasted by the user (e.g. https://xxx.feishu.cn/drive/folder/TOKEN).
+        # Handles the two optional URLs in the binding tutorial.  Either URL
+        # can be submitted alone; if both are valid, both folders are bound.
         # dept_id: open_department_id carried from the tutorial card's action_value; empty for single-dept
         #          managers (template card can't carry it), so we fall back to their only managed dept.
-        # token:   the folder token extracted from the URL path segment after /folder/ — this is what
-        #          gets saved to .env and used by the report pipeline to access the Feishu folder.
-        # Failure path: any validation error resets the card to the not-binding state with failed=True
-        #               (shows red header + 绑定失败 status) and surfaces the reason as a toast.
+        # Each token is stored in its own weekly/daily environment key.
         if action_key == "send_folder_url":
-            logger.info("[Lark_card] 提交文件夹链接")
-            from ..utils.env_config import extract_folder_token_from_url, set_dept_folder_token
+            from ..utils.env_config import (
+                extract_folder_token_from_url,
+                set_dept_daily_report_folder_token,
+                set_dept_folder_token,
+            )
 
             form_value: dict = action.form_value or {} if action is not None else {}
-            url = str(form_value.get("folder_url_input", "")).strip()
+            weekly_url = str(
+                form_value.get("WRfolder_url_input")
+                or form_value.get("folder_url_input")  # old card compatibility
+                or ""
+            ).strip()
+            daily_url = str(form_value.get("DRfolder_url_input") or "").strip()
             dept_id = action_value.get("dept_id", "")
-            logger.info(f"[Lark_card][send_folder_url] form_value={form_value} url={repr(url)}")
 
             # Single-dept template card doesn't carry dept_id in action_value — derive from org tree.
             if not dept_id:
@@ -501,28 +534,32 @@ class LarkCardService:
                 if managed:
                     dept_id = getattr(managed[0]["dept"], "open_department_id", "") or ""
 
-            if not url:
+            if not weekly_url and not daily_url:
                 return P2CardActionTriggerResponse({
                     "toast": {
                         "type": "error",
-                        "content": "请粘贴飞书文件夹链接",
-                        "i18n": {"zh_cn": "请粘贴飞书文件夹链接", "en_us": "Please paste a Feishu folder URL."},
+                        "content": "请至少粘贴一个周报或日报文件夹链接",
+                        "i18n": {"zh_cn": "请至少粘贴一个周报或日报文件夹链接"},
                     },
-                    "card": self._build_not_binding_card_data(open_id, failed=True),
+                    "card": self._build_not_binding_card_data(open_id),
                 })
 
-            token = extract_folder_token_from_url(url)
-            if not token:
+            weekly_token = extract_folder_token_from_url(weekly_url) if weekly_url else None
+            daily_token = extract_folder_token_from_url(daily_url) if daily_url else None
+            invalid_types = []
+            if weekly_url and not weekly_token:
+                invalid_types.append("周报")
+            if daily_url and not daily_token:
+                invalid_types.append("日报")
+            if invalid_types:
+                invalid_label = "、".join(invalid_types)
                 return P2CardActionTriggerResponse({
                     "toast": {
                         "type": "error",
-                        "content": "链接格式不正确，请粘贴飞书文件夹链接（如：https://xxx.feishu.cn/drive/folder/xxx）",
-                        "i18n": {
-                            "zh_cn": "链接格式不正确，请粘贴飞书文件夹链接",
-                            "en_us": "Invalid URL. Expected: https://xxx.feishu.cn/drive/folder/xxx",
-                        },
+                        "content": f"{invalid_label}文件夹链接格式不正确，请检查后重试",
+                        "i18n": {"zh_cn": f"{invalid_label}文件夹链接格式不正确，请检查后重试"},
                     },
-                    "card": self._build_not_binding_card_data(open_id, failed=True),
+                    "card": self._build_not_binding_card_data(open_id),
                 })
 
             if not dept_id:
@@ -532,31 +569,28 @@ class LarkCardService:
                         "content": "无法确定绑定部门，请联系管理员",
                         "i18n": {"zh_cn": "无法确定绑定部门，请联系管理员", "en_us": "Cannot determine department. Contact admin."},
                     },
-                    "card": self._build_not_binding_card_data(open_id, failed=True),
+                    "card": self._build_not_binding_card_data(open_id),
                 })
 
-            set_dept_folder_token(dept_id, token)
-            logger.info(f"[Lark_card] 文件夹绑定成功: dept={dept_id} token={token}")
-            # Resolve dept name from cached org tree for the success card display.
-            dept_name = ""
-            if self.contact_service:
-                for e in self.contact_service.get_cached_org_tree_sync(open_id):
-                    if getattr(e["dept"], "open_department_id", "") == dept_id:
-                        dept_name = e["dept"].name or ""
-                        break
+            bound_types = []
+            if weekly_token:
+                set_dept_folder_token(dept_id, weekly_token)
+                bound_types.append("周报")
+            if daily_token:
+                set_dept_daily_report_folder_token(dept_id, daily_token)
+                bound_types.append("日报")
+
+            bound_label = "和".join(bound_types)
+            logger.info(
+                f"[Lark_card] 文件夹绑定成功: dept={dept_id} types={','.join(bound_types)}"
+            )
             return P2CardActionTriggerResponse({
                 "toast": {
                     "type": "success",
-                    "content": "绑定成功！",
-                    "i18n": {"zh_cn": "绑定成功！", "en_us": "Binding successful!"},
+                    "content": f"{bound_label}文件夹绑定成功！",
+                    "i18n": {"zh_cn": f"{bound_label}文件夹绑定成功！"},
                 },
-                "card": {
-                    "type": "template",
-                    "data": {
-                        "template_id": WRSBOT_BINDING_FEEDBACK_SUCCESS_CARD_ID,
-                        "template_variable": {"open_id": open_id, "dept_name": dept_name},
-                    },
-                },
+                "card": self._build_not_binding_card_data(open_id),
             })
 
         # Triggered from the binding-success card when the manager wants to re-bind.
@@ -1531,31 +1565,16 @@ class LarkCardService:
     def _build_not_binding_card_data(self, open_id: str, *, failed: bool = False) -> dict:
         """Return the card 'type'+'data' dict for the binding status card.
 
-        All-bound departments use the published success template. Any unbound
-        or failed state uses an inline card so the visible status is generated
-        from the same folder-token lookup as the backend, rather than relying
-        on a Card Builder template's static/default status text.
+        A single managed department uses the 文件夹配置 template, which exposes
+        independent weekly-report and daily-report binding variables.  The
+        multi-department inline card remains the existing weekly-only view.
         """
-        from ..utils.env_config import get_dept_folder_token
+        from ..utils.env_config import (
+            get_dept_daily_report_folder_token,
+            get_dept_folder_token,
+        )
 
         managed = self._get_managed_depts(open_id)
-
-        # All depts bound and no failure → show success card.
-        # dept_name: single dept uses the real name; multiple depts show a collective label.
-        if not failed and managed and all(
-            bool(get_dept_folder_token(getattr(e["dept"], "open_department_id", "") or ""))
-            for e in managed
-        ):
-            dept_name = managed[0]["dept"].name or "" if len(managed) == 1 else "所有部门"
-            if len(managed) == 1:
-                dept_name = self._binding_card_dept_name(open_id, dept_name)
-            return {
-                "type": "template",
-                "data": {
-                    "template_id": WRSBOT_BINDING_FEEDBACK_SUCCESS_CARD_ID,
-                    "template_variable": {"open_id": open_id, "dept_name": dept_name},
-                },
-            }
 
         if not managed:
             return {
@@ -1563,12 +1582,66 @@ class LarkCardService:
                 "data": {
                     "template_id": WRSBOT_NOT_BINDiNG_FEEDBACK_CARD_ID,
                     "template_variable": {
+                        "open_id": open_id,
                         "dept_name": "未知部门",
                         "dept_num": 0,
                         "unreg_dept_num": 0,
                         "binding_status": "绑定失败" if failed else "未绑定",
                         "heading_colour_code": "red" if failed else "orange",
                         "doc_is_not_binded": True,
+                        "folder_binding_status": "0/0文件夹已绑定",
+                        "wr_binding_status": "绑定失败" if failed else "未绑定",
+                        "heading_colour": "red",
+                        "wr_binding_colour_code": "red",
+                        "dr_binding_status": "未绑定",
+                        "wr_doc_is_not_binded": True,
+                        "dr_doc_is_not_binded": True,
+                        "dr_binding_colour_code": "red",
+                    },
+                },
+            }
+
+        if len(managed) == 1:
+            dept = managed[0]["dept"]
+            dept_id = getattr(dept, "open_department_id", "") or ""
+            weekly_bound = bool(get_dept_folder_token(dept_id)) and not failed
+            daily_bound = bool(get_dept_daily_report_folder_token(dept_id))
+
+            def _status(is_bound: bool, *, is_failed: bool = False) -> tuple[str, str]:
+                if is_failed:
+                    return "绑定失败", "red"
+                return ("已绑定", "green") if is_bound else ("未绑定", "red")
+
+            wr_status, wr_colour = _status(weekly_bound, is_failed=failed)
+            dr_status, dr_colour = _status(daily_bound)
+            bound_count = int(weekly_bound) + int(daily_bound)
+            heading_colour = ("red", "orange", "green")[bound_count]
+            dept_name = self._binding_card_dept_name(open_id, dept.name or "")
+
+            return {
+                "type": "template",
+                "data": {
+                    "template_id": WRSBOT_NOT_BINDiNG_FEEDBACK_CARD_ID,
+                    "template_variable": {
+                        # Existing weekly-card variables are retained for
+                        # compatibility with the copied card template.
+                        "open_id": open_id,
+                        "dept_id": dept_id,
+                        "dept_name": dept_name,
+                        "dept_num": 1,
+                        "unreg_dept_num": 0 if weekly_bound else 1,
+                        "binding_status": wr_status,
+                        "heading_colour_code": wr_colour,
+                        "doc_is_not_binded": not weekly_bound,
+                        # New dual-folder variables used by 文件夹配置.
+                        "folder_binding_status": f"{bound_count}/2文件夹已绑定",
+                        "wr_binding_status": wr_status,
+                        "heading_colour": heading_colour,
+                        "wr_binding_colour_code": wr_colour,
+                        "dr_binding_status": dr_status,
+                        "wr_doc_is_not_binded": not weekly_bound,
+                        "dr_doc_is_not_binded": not daily_bound,
+                        "dr_binding_colour_code": dr_colour,
                     },
                 },
             }
